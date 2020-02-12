@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <parent>
+        <groupId>com.blazebit</groupId>
+        <artifactId>blazebit-parent</artifactId>
+        <version>11</version>
+    </parent>
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <artifactId>blaze-ivm</artifactId>
+    <packaging>pom</packaging>
+    <version>1.0.0-SNAPSHOT</version>
+    <modules>
+        <module>core</module>
+        <module>testsuite</module>
+    </modules>
+
+    <name>Blazebit Blaze-IVM</name>
+    <description>Blazebit Blaze-IVM</description>
+
+    <properties>
+        <jdk8.home>${env.JAVA_HOME}</jdk8.home>
+        <java.version>1.8</java.version>
+        <maven.compiler.target>${java.version}</maven.compiler.target>
+        <maven.compiler.source>${java.version}</maven.compiler.source>
+        <version.checkstyle>8.7</version.checkstyle>
+        <maven.min.version>3.3.1</maven.min.version>
+        <maven.build.timestamp.format>yyyy</maven.build.timestamp.format>
+        <currentYearDynamic>${maven.build.timestamp}</currentYearDynamic>
+
+        <version.calcite>1.21.0</version.calcite>
+        <version.junit>4.13</version.junit>
+        <version.hikaricp>3.4.2</version.hikaricp>
+        <version.hibernate>5.4.11.Final</version.hibernate>
+        <version.postgres-jdbc>42.2.10</version.postgres-jdbc>
+    </properties>
+
+    <inceptionYear>2020</inceptionYear>
+
+    <organization>
+        <name>Blazebit</name>
+        <url>http://www.blazebit.com</url>
+    </organization>
+
+    <scm>
+        <connection>scm:git:git@bitbucket.org:blazebit/blaze-ivm.git</connection>
+        <developerConnection>scm:git:git@bitbucket.org:blazebit/blaze-ivm.git</developerConnection>
+        <url>git@bitbucket.org:blazebit/blaze-ivm.git</url>
+        <tag>HEAD</tag>
+    </scm>
+
+    <developers>
+        <developer>
+            <id>christian</id>
+            <name>Christian Beikov</name>
+            <email>christian@blazebit.com</email>
+            <organization>Blazebit</organization>
+            <organizationUrl>http://www.blazebit.com</organizationUrl>
+            <timezone>UTC+1</timezone>
+            <roles>
+                <role>Project Owner</role>
+                <role>Committer</role>
+            </roles>
+        </developer>
+        <developer>
+            <id>Mobe91</id>
+            <name>Moritz Becker</name>
+            <email>moritz.becker@gmx.at</email>
+            <timezone>UTC+1</timezone>
+            <roles>
+                <role>Committer</role>
+            </roles>
+        </developer>
+    </developers>
+</project>
