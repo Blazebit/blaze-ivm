@@ -1,21 +1,18 @@
 package com.blazebit.ivm.testsuite;
 
-import com.blazebit.ivm.core.TriggerBasedIvmStrategy;
 import com.blazebit.ivm.testsuite.entity.Article;
 import com.blazebit.ivm.testsuite.entity.Order;
 import com.blazebit.ivm.testsuite.entity.OrderPosition;
 import org.junit.Test;
 
-import java.util.List;
-
-import static org.junit.Assert.assertEquals;
-
 /**
  *
  * @author Moritz Becker
+ * @author Christian Beikov
  * @since 1.0.0
  */
-public class SimpleTest extends AbstractHibernatePersistenceTest {
+public class SimpleTest extends MaterializationTest {
+
     @Override
     protected Class<?>[] getEntityClasses() {
         return new Class[] {
@@ -37,23 +34,21 @@ public class SimpleTest extends AbstractHibernatePersistenceTest {
         orderPosition.setArticle(article);
         orderPosition.setOrder(order);
         em.persist(orderPosition);
+        em.flush();
 
         // create view
         String viewQuery = "SELECT art.id as art_id, ord.id as ord_id, art.name, ordpos.amount FROM _order ord " +
-                "LEFT JOIN order_position ordpos ON ordpos.order_id = ord.id " +
-                "LEFT JOIN article art ON art.id = ordpos.article_id";
-        em.createNativeQuery("CREATE MATERIALIZED VIEW TEST_VIEW AS " + viewQuery).executeUpdate();
-        TriggerBasedIvmStrategy triggerBasedIvmStrategy = new TriggerBasedIvmStrategy(viewQuery);
-        triggerBasedIvmStrategy.generateTriggerDefinitionForBaseTable("ordpos");
+            "LEFT JOIN order_position ordpos ON ordpos.order_id = ord.id " +
+            "LEFT JOIN article art ON art.id = ordpos.article_id " +
+            "WHERE ord.id > 0";
+        setupMaterialization(viewQuery);
 
         // When
         Order newOrder = new Order();
         em.persist(newOrder);
+        em.flush();
 
         // Then
-        List<?> actualResult = em.createNativeQuery("SELECT * FROM TEST_VIEW").getResultList();
-        em.createNativeQuery("REFRESH MATERIALIZED VIEW TEST_VIEW").executeUpdate();
-        List<?> expectedResult = em.createNativeQuery("SELECT * FROM TEST_VIEW").getResultList();
-        assertEquals(expectedResult, actualResult);
+        assertMaterializationEqual();
     }
 }
