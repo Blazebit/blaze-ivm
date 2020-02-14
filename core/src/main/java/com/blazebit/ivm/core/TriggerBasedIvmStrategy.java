@@ -3,6 +3,8 @@ package com.blazebit.ivm.core;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Sets;
+import org.apache.calcite.adapter.jdbc.JdbcConvention;
+import org.apache.calcite.adapter.jdbc.JdbcSchema;
 import org.apache.calcite.avatica.util.Casing;
 import org.apache.calcite.avatica.util.Quoting;
 import org.apache.calcite.config.Lex;
@@ -10,13 +12,19 @@ import org.apache.calcite.jdbc.CalciteConnection;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.prepare.PlannerImpl;
+import org.apache.calcite.prepare.RelOptTableImpl;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
+import org.apache.calcite.rel.RelShuttleImpl;
+import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.logical.LogicalFilter;
 import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rel.logical.LogicalProject;
+import org.apache.calcite.rel.logical.LogicalTableScan;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
+import org.apache.calcite.rel.rel2sql.RelToSqlConverter;
+import org.apache.calcite.rel.rel2sql.SqlImplementor;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexInputRef;
@@ -24,14 +32,21 @@ import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexTableInputRef;
 import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.rex.RexVisitorImpl;
+import org.apache.calcite.schema.Table;
+import org.apache.calcite.sql.SqlBinaryOperator;
+import org.apache.calcite.sql.SqlDialect;
 import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.SqlOperator;
+import org.apache.calcite.sql.dialect.PostgresqlSqlDialect;
 import org.apache.calcite.sql.parser.SqlParser;
+import org.apache.calcite.sql.pretty.SqlPrettyWriter;
 import org.apache.calcite.sql.validate.SqlConformanceEnum;
 import org.apache.calcite.tools.FrameworkConfig;
 import org.apache.calcite.tools.Frameworks;
 import org.apache.calcite.util.Pair;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -48,10 +63,13 @@ import java.util.Set;
  */
 public class TriggerBasedIvmStrategy {
 
+    private final SqlDialect dialect;
     private final RexBuilder rexBuilder;
     private final RelRoot relRoot;
+    private final String materializationTableName;
+    private final Table materializationTable;
 
-    public TriggerBasedIvmStrategy(CalciteConnection calciteConnection, String viewSqlQuery) {
+    public TriggerBasedIvmStrategy(CalciteConnection calciteConnection, String viewSqlQuery, String materializationTableName) {
         try {
             final FrameworkConfig config = Frameworks.newConfigBuilder()
                 .parserConfig(
@@ -67,14 +85,17 @@ public class TriggerBasedIvmStrategy {
             PlannerImpl planner = new PlannerImpl(config);
             SqlNode sqlNode = planner.parse(viewSqlQuery);
             planner.validate(sqlNode);
+            this.dialect = config.getDefaultSchema().unwrap(JdbcSchema.class).dialect;
             this.relRoot = planner.rel(sqlNode);
             this.rexBuilder = new RexBuilder(planner.getTypeFactory());
+            this.materializationTableName = materializationTableName;
+            this.materializationTable = config.getDefaultSchema().getTable(materializationTableName);
         } catch (Exception e) {
             throw new RuntimeException("parse failed", e);
         }
     }
 
-    public String generateTriggerDefinitionForBaseTable() {
+    public Map<String, TriggerDefinition> generateTriggerDefinitionForBaseTable() {
         // produce join-disjunctive normal form
         Set<Term> normalize = normalize(relRoot.rel);
         // create subsumption graph
@@ -90,7 +111,117 @@ public class TriggerBasedIvmStrategy {
         // - apply direct
         // - create query for indirect delta
         // - apply indirect delta
-        return null;
+
+        Map<String, TriggerDefinition> triggers = new HashMap<>();
+        final RelMetadataQuery metadataQuery = relRoot.rel.getCluster().getMetadataQuery();
+        for (RexTableInputRef.RelTableRef tableReference : metadataQuery.getTableReferences(relRoot.rel)) {
+            StringBuilder triggerSb = new StringBuilder();
+            String tableName = tableReference.getQualifiedName().get(1);
+            String triggerName = tableName + "_trig";
+            String triggerFunctionName = tableName + "_trig_fn";
+            String dropScript = "DROP TRIGGER IF EXISTS " + triggerName + " ON " + tableName + "; DROP FUNCTION IF EXISTS " + triggerFunctionName + ";";
+            triggerSb.append("CREATE FUNCTION ").append(triggerFunctionName).append(" RETURNS trigger AS \n$BODY$\nBEGIN\n");
+            generateTrigger(triggerSb, normalize, tableReference.getTable());
+            triggerSb.append("\nRETURN NEW;");
+            triggerSb.append("\nEND;\n$BODY$;\n");
+            triggerSb.append("CREATE TRIGGER ").append(triggerName).append(" AFTER INSERT OR UPDATE OR DELETE ON ").append(tableName).append(" FOR EACH ROW EXECUTE PROCEDURE ").append(triggerFunctionName).append("();");
+            triggers.put(tableName, new TriggerDefinition(dropScript, triggerSb.toString()));
+        }
+
+        return triggers;
+    }
+
+    private static JoinRelType forExcludeRightNullExtended(JoinRelType joinType) {
+        if (joinType == JoinRelType.FULL) {
+            return JoinRelType.LEFT;
+        } else if (joinType == JoinRelType.RIGHT) {
+            return JoinRelType.INNER;
+        }
+        return joinType;
+    }
+
+    private void generateTrigger(StringBuilder sb, Set<Term> normalizedTerms, RelOptTable table) {
+        // The most important step here is to move the table T to the left
+        // In addition, we rewrite joins to exclude null-extended tuples
+//        LogicalTableScan logicalTableScan = LogicalTableScan.create(relRoot.rel.getCluster(), RelOptTableImpl.create(table.getRelOptSchema(), table.getRowType(), table.unwrap(Table.class), ImmutableList.of("NEW")));
+//        SqlOperator sqlOperator = rexBuilder.getOpTab().getOperatorList().stream().filter(o -> "=".equals(o.getName())).findFirst().get();
+        RelNode deltaVDRelNode = relRoot.rel.accept(new RelShuttleImpl() {
+            @Override
+            public RelNode visit(LogicalJoin join) {
+                JoinRelType joinType = join.getJoinType();
+                // For vD we only care about non-null extending tuples, so we transform joins to exclude null extended tuples
+                if (table.equals(join.getLeft().getTable())) {
+                    joinType = forExcludeRightNullExtended(joinType);
+//                    RexUtil.composeConjunction(rexBuilder, Arrays.asList(join.getCondition(), rexBuilder.makeCall(sqlOperator, logicalTableScan.)))
+                    RexNode condition = join.getCondition();
+                    return join.copy(join.getTraitSet(), condition, join.getLeft(), join.getRight(), joinType, join.isSemiJoinDone());
+                } else if (table.equals(join.getRight().getTable())) {
+                    joinType = forExcludeRightNullExtended(joinType.swap());
+                    return join.copy(join.getTraitSet(), join.getCondition(), join.getRight(), join.getLeft(), joinType, join.isSemiJoinDone());
+                } else {
+                    RelNode left = join.getLeft().accept(this);
+                    RelNode right = join.getRight().accept(this);
+                    if (left == join.getLeft()) {
+                        // Nothing changed on the left side
+                        if (right == join.getRight()) {
+                            // Nothing changed, no source table in this join
+                            return join;
+                        }
+
+                        // Source table on the right side, so we have to swap
+                        JoinRelType newJoinType = forExcludeRightNullExtended(joinType.swap());
+                        return join.copy(join.getTraitSet(), join.getCondition(), right, left, newJoinType, join.isSemiJoinDone());
+                    } else {
+                        // The left side contains the source table
+                        JoinRelType newJoinType = forExcludeRightNullExtended(joinType);
+                        return join.copy(join.getTraitSet(), join.getCondition(), left, right, newJoinType, join.isSemiJoinDone());
+                    }
+                }
+            }
+        });
+
+
+        sb.append("CREATE TEMPORARY TABLE _delta1 AS ");
+
+        SqlImplementor.Result result = new RelToSqlConverter(dialect).visitChild(0, deltaVDRelNode);
+        sb.append(new SqlPrettyWriter(dialect).format(result.asSelect())).append(" AND NEW.order_id = 1");
+        sb.append("IF OLD IS NOT NULL THEN\n");
+        // DELETE
+        sb.append("DELETE FROM ").append(materializationTableName).append(" a WHERE ");
+
+        sb.append(";\nEND IF;\n");
+
+
+        sb.append("IF NEW IS NOT NULL THEN\n");
+        // INSERT
+        sb.append("INSERT INTO ").append(materializationTableName).append("(");
+        List<String> fieldNames = materializationTable.getRowType(rexBuilder.getTypeFactory()).getFieldNames();
+        for (String fieldName : fieldNames) {
+            sb.append(fieldName).append(',');
+        }
+        sb.setCharAt(sb.length() - 1, ')');
+        sb.append(" SELECT ");
+
+        sb.append(" FROM (VALUES(1)) a");
+        sb.append(";\nEND IF;\n");
+    }
+
+    public static class TriggerDefinition {
+        private final String dropScript;
+        private final String createScript;
+
+        public TriggerDefinition(String dropScript, String createScript) {
+            this.dropScript = dropScript;
+            this.createScript = createScript;
+        }
+
+        public String getDropScript() {
+            return dropScript;
+        }
+
+        public String getCreateScript() {
+            return createScript;
+        }
     }
 
     private Set<Term> normalize(RelNode relNode) {
@@ -189,8 +320,11 @@ public class TriggerBasedIvmStrategy {
 
             @Override
             public Boolean visitInputRef(RexInputRef inputRef) {
-                for (RexNode rexNode : metadataQuery.getExpressionLineage(relNode, inputRef)) {
-                    rexNode.accept(this);
+                Set<RexNode> expressionLineage = metadataQuery.getExpressionLineage(relNode, inputRef);
+                if (expressionLineage != null) {
+                    for (RexNode rexNode : expressionLineage) {
+                        rexNode.accept(this);
+                    }
                 }
 
                 return null;

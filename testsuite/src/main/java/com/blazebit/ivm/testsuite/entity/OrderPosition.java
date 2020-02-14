@@ -1,5 +1,6 @@
 package com.blazebit.ivm.testsuite.entity;
 
+import javax.persistence.Column;
 import javax.persistence.Embeddable;
 import javax.persistence.EmbeddedId;
 import javax.persistence.Entity;
@@ -79,6 +80,7 @@ public class OrderPosition {
         private Long articleId;
         private Long orderId;
 
+        @Column(name = "article_id")
         public Long getArticleId() {
             return articleId;
         }
@@ -87,6 +89,7 @@ public class OrderPosition {
             this.articleId = articleId;
         }
 
+        @Column(name = "order_id")
         public Long getOrderId() {
             return orderId;
         }

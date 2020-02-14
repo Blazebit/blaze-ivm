@@ -13,6 +13,7 @@ import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
@@ -25,17 +26,18 @@ import static org.junit.Assert.fail;
  */
 public abstract class MaterializationTest extends AbstractHibernatePersistenceTest {
 
-    protected void setupMaterialization(String viewQuery) {
+    protected Map<String, TriggerBasedIvmStrategy.TriggerDefinition> setupMaterialization(String viewQuery) {
         try {
+            String materializationTableName = "trigger_mat";
             Connection connection = em.unwrap(SessionImplementor.class).connection();
             try (Statement statement = connection.createStatement()) {
                 statement.execute("DROP MATERIALIZED VIEW IF EXISTS native_mat");
-                statement.execute("DROP TABLE IF EXISTS trigger_mat CASCADE");
+                statement.execute("DROP TABLE IF EXISTS " + materializationTableName + " CASCADE");
                 statement.execute("CREATE MATERIALIZED VIEW native_mat AS " + viewQuery);
             }
             connection.commit();
             StringBuilder sb = new StringBuilder();
-            sb.append("CREATE TABLE trigger_mat (");
+            sb.append("CREATE TABLE ").append(materializationTableName).append(" (");
             try (ResultSet rs = connection.getMetaData().getColumns(null, null, "native_mat", null)) {
                 while (rs.next()) {
                     sb.append(rs.getString("COLUMN_NAME"));
@@ -72,8 +74,21 @@ public abstract class MaterializationTest extends AbstractHibernatePersistenceTe
             calciteConnection.getRootSchema().add(name, jdbcSchema);
             calciteConnection.setSchema(name);
 
-            TriggerBasedIvmStrategy triggerBasedIvmStrategy = new TriggerBasedIvmStrategy(calciteConnection, viewQuery);
-            triggerBasedIvmStrategy.generateTriggerDefinitionForBaseTable();
+            TriggerBasedIvmStrategy triggerBasedIvmStrategy = new TriggerBasedIvmStrategy(calciteConnection, viewQuery, materializationTableName);
+            Map<String, TriggerBasedIvmStrategy.TriggerDefinition> triggerDefinitions = triggerBasedIvmStrategy.generateTriggerDefinitionForBaseTable();
+            for (TriggerBasedIvmStrategy.TriggerDefinition triggerDefinition : triggerDefinitions.values()) {
+                try (Statement statement = connection.createStatement()) {
+                    statement.execute(triggerDefinition.getDropScript());
+                }
+            }
+            connection.commit();
+            for (TriggerBasedIvmStrategy.TriggerDefinition triggerDefinition : triggerDefinitions.values()) {
+                try (Statement statement = connection.createStatement()) {
+                    statement.execute(triggerDefinition.getCreateScript());
+                }
+            }
+            connection.commit();
+            return triggerDefinitions;
         } catch (Exception ex) {
             throw new RuntimeException(ex);
         } finally {

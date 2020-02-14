@@ -1,9 +1,12 @@
 package com.blazebit.ivm.testsuite;
 
+import com.blazebit.ivm.core.TriggerBasedIvmStrategy;
 import com.blazebit.ivm.testsuite.entity.Article;
 import com.blazebit.ivm.testsuite.entity.Order;
 import com.blazebit.ivm.testsuite.entity.OrderPosition;
 import org.junit.Test;
+
+import java.util.Map;
 
 /**
  *
@@ -41,7 +44,7 @@ public class SimpleTest extends MaterializationTest {
             "LEFT JOIN order_position ordpos ON ordpos.order_id = ord.id " +
             "LEFT JOIN article art ON art.id = ordpos.article_id " +
             "WHERE ord.id > 0";
-        setupMaterialization(viewQuery);
+        Map<String, TriggerBasedIvmStrategy.TriggerDefinition> triggerDefinitions = setupMaterialization(viewQuery);
 
         // When
         Order newOrder = new Order();
