@@ -88,6 +88,10 @@ public abstract class MaterializationTest extends AbstractHibernatePersistenceTe
                 }
             }
             connection.commit();
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("INSERT INTO " + materializationTableName + " " + viewQuery);
+            }
+            connection.commit();
             return triggerDefinitions;
         } catch (Exception ex) {
             throw new RuntimeException(ex);
