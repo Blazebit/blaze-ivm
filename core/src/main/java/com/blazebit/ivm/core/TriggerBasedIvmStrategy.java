@@ -4,7 +4,6 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Sets;
 import org.apache.calcite.adapter.jdbc.JdbcSchema;
-import org.apache.calcite.adapter.jdbc.JdbcTable;
 import org.apache.calcite.avatica.util.Casing;
 import org.apache.calcite.avatica.util.Quoting;
 import org.apache.calcite.config.Lex;
@@ -24,7 +23,6 @@ import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.rel2sql.RelToSqlConverter;
 import org.apache.calcite.rel.rel2sql.SqlImplementor;
 import org.apache.calcite.rel.rules.JoinCommuteRule;
-import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rel.type.RelDataTypeFieldImpl;
 import org.apache.calcite.rel.type.RelRecordType;
@@ -39,7 +37,6 @@ import org.apache.calcite.rex.RexVisitorImpl;
 import org.apache.calcite.schema.Table;
 import org.apache.calcite.sql.JoinType;
 import org.apache.calcite.sql.SqlBasicCall;
-import org.apache.calcite.sql.SqlBinaryOperator;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlDialect;
 import org.apache.calcite.sql.SqlIdentifier;
@@ -48,7 +45,6 @@ import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlSelect;
-import org.apache.calcite.sql.SqlUtil;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParser;
 import org.apache.calcite.sql.parser.SqlParserPos;
@@ -138,7 +134,7 @@ public class TriggerBasedIvmStrategy {
             String tableName = tableNameIdentifier.toString();
             String triggerName = tableName + "_trig";
             String triggerFunctionName = tableName + "_trig_fn";
-            String dropScript = "DROP TRIGGER IF EXISTS " + triggerName + " ON " + tableName + "; DROP FUNCTION IF EXISTS " + triggerFunctionName + ";";
+            String dropScript = "DROP TRIGGER IF EXISTS " + triggerName + " ON " + tableName + "; DROP FUNCTION IF EXISTS " + triggerFunctionName + "();";
             triggerSb.append("CREATE FUNCTION ").append(triggerFunctionName).append("() RETURNS trigger AS \n$$\nBEGIN\n");
             generateTrigger(triggerSb, tableNameIdentifier);
             triggerSb.append("\nRETURN NEW;");
@@ -231,33 +227,35 @@ public class TriggerBasedIvmStrategy {
         return tables;
     }
 
-    private void generateTrigger(StringBuilder sb, SqlIdentifier tableName) {
+    private void generateTrigger(StringBuilder sb, SqlIdentifier baseTable) {
+        // Traverse path from the baseTable join to the root and change joins so that baseTable ends up on the very left side
+        // Return new baseTable root join node (left side of this node is the baseTable)
         SqlNode newSqlNode = sqlNode.accept(new SqlShuttle() {
             @Override
             public SqlNode visit(SqlCall call) {
                 if (call instanceof SqlJoin) {
                     SqlJoin join = (SqlJoin) call;
-                    if (tableName.equals(getFirstIdentifier(join.getLeft()))) {
+                    if (baseTable.equals(getFirstIdentifier(join.getLeft()))) {
                         SqlLiteral joinType = forExcludeRightNullExtended(join.getJoinTypeNode());
-                        return new SqlJoin(join.getParserPosition(), join.getLeft(), join.isNaturalNode(), joinType, join.getRight(), join.getConditionTypeNode(), createNewCorrelatedJoinCondition(join.getCondition(), join.getLeft()));
-                    } else if (tableName.equals(getFirstIdentifier(join.getRight()))) {
+                        return new SqlJoin(join.getParserPosition(), join.getLeft(), join.isNaturalNode(), joinType, join.getRight(), join.getConditionTypeNode(), join.getCondition());
+                    } else if (baseTable.equals(getFirstIdentifier(join.getRight()))) {
                         SqlLiteral joinType = forExcludeRightNullExtended(swap(join.getJoinTypeNode()));
-                        return new SqlJoin(join.getParserPosition(), join.getRight(), join.isNaturalNode(), joinType, join.getLeft(), join.getConditionTypeNode(), createNewCorrelatedJoinCondition(join.getCondition(), join.getRight()));
+                        return new SqlJoin(join.getParserPosition(), join.getRight(), join.isNaturalNode(), joinType, join.getLeft(), join.getConditionTypeNode(), join.getCondition());
                     } else {
                         SqlNode left = join.getLeft().accept(this);
                         SqlNode right = join.getRight().accept(this);
                         if (left == join.getLeft()) {
                             // Nothing changed on the left side
                             if (right == join.getRight()) {
-                                // Nothing changed, no source table in this join
+                                // Nothing changed, baseTable not referenced in this join
                                 return join;
                             }
 
-                            // Source table on the right side, so we have to swap
+                            // baseTable on the right side, so we have to swap
                             SqlLiteral joinType = forExcludeRightNullExtended(swap(join.getJoinTypeNode()));
                             return new SqlJoin(join.getParserPosition(), right, join.isNaturalNode(), joinType, left, join.getConditionTypeNode(), join.getCondition());
                         } else {
-                            // The left side contains the source table
+                            // baseTable on the left side
                             SqlLiteral newJoinType = forExcludeRightNullExtended(join.getJoinTypeNode());
                             return new SqlJoin(join.getParserPosition(), left, join.isNaturalNode(), newJoinType, right, join.getConditionTypeNode(), join.getCondition());
                         }
@@ -268,6 +266,7 @@ public class TriggerBasedIvmStrategy {
             }
 
             private SqlNode createNewCorrelatedJoinCondition(SqlNode condition, SqlNode node) {
+                // TODO: the ctid condition needs to go into the where clause.
                 SqlIdentifier alias;
                 if (node instanceof SqlIdentifier) {
                     alias = (SqlIdentifier) node;
@@ -303,6 +302,35 @@ public class TriggerBasedIvmStrategy {
                 return null;
             }
         });
+
+        SqlNode from = ((SqlSelect) newSqlNode).getFrom();
+        SqlIdentifier rootAlias;
+        while (from instanceof SqlJoin) {
+            from = ((SqlJoin) from).getLeft();
+        }
+        if (from instanceof SqlIdentifier) {
+            rootAlias = (SqlIdentifier) from;
+        } else if (from instanceof SqlBasicCall && ((SqlBasicCall) from).getOperator().getKind() == SqlKind.AS) {
+            rootAlias = (SqlIdentifier) ((SqlBasicCall) from).getOperands()[1];
+        } else {
+            throw new IllegalArgumentException("Can't extract alias from node: " + from);
+        }
+        List<String> keyColumns = Arrays.asList("ctid");
+        for (String keyColumn : keyColumns) {
+            ((SqlSelect) newSqlNode).setWhere(
+                    new SqlBasicCall(SqlStdOperatorTable.AND, new SqlNode[]{
+                        ((SqlSelect) newSqlNode).getWhere() == null ? SqlLiteral.createBoolean(true, from.getParserPosition()) : ((SqlSelect) newSqlNode).getWhere(),
+                        new SqlBasicCall(SqlStdOperatorTable.EQUALS, new SqlNode[]{
+                            rootAlias.plus(keyColumn, SqlParserPos.ZERO),
+
+                            new SqlBasicCall(SqlStdOperatorTable.DOT, new SqlNode[]{
+                                SqlLiteral.createSymbol(TransitionTable.NEW, SqlParserPos.ZERO),
+                                new SqlIdentifier(ImmutableList.of(keyColumn), SqlParserPos.ZERO)
+                            }, SqlParserPos.ZERO)
+                        }, SqlParserPos.ZERO)
+                    }, SqlParserPos.ZERO)
+            );
+        }
 
         sb.append("CREATE TEMPORARY TABLE _delta1 AS ");
 

@@ -10,12 +10,13 @@ import org.hibernate.engine.spi.SessionImplementor;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 
-import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
 /**
@@ -113,33 +114,46 @@ public abstract class MaterializationTest extends AbstractHibernatePersistenceTe
                     columns.add(rs.getString("COLUMN_NAME"));
                 }
             }
-            StringBuilder sb = new StringBuilder();
-            sb.append('(');
-            appendSelect(sb, "native_mat", columns);
-            sb.append(" EXCEPT ");
-            appendSelect(sb, "trigger_mat", columns);
-            sb.append(") UNION ALL (");
-            appendSelect(sb, "trigger_mat", columns);
-            sb.append(" EXCEPT ");
-            appendSelect(sb, "native_mat", columns);
-            sb.append(')');
+            StringBuilder sbMissingRows = new StringBuilder();
+            appendSelect(sbMissingRows, "native_mat", columns);
+            sbMissingRows.append(" EXCEPT ");
+            appendSelect(sbMissingRows, "trigger_mat", columns);
+            
+            StringBuilder sbStaleRows = new StringBuilder();
+            appendSelect(sbStaleRows, "trigger_mat", columns);
+            sbStaleRows.append(" EXCEPT ");
+            appendSelect(sbStaleRows, "native_mat", columns);
             try (Statement statement = connection.createStatement()) {
-                try (ResultSet rs = statement.executeQuery(sb.toString())) {
-                    if (rs.next()) {
-                        StringBuilder rows = new StringBuilder();
-                        rows.append("Native and trigger materialized tables are not equal!\n");
-                        for (String column : columns) {
-                            rows.append(column).append('|');
-                        }
-                        rows.setCharAt(rows.length() - 1, '\n');
-                        do {
-                            for (int i = 1; i <= columns.size(); i++) {
-                                rows.append(rs.getString(i)).append('|');
+                StringBuilder rows = new StringBuilder();
+                rows.append("Native and trigger materialized tables are not equal!\n");
+                Function<String, Function<String, Boolean>> t = (String title) -> (String selectStatement) -> {
+                    boolean _assertionFailed = false;
+                    try (ResultSet rs = statement.executeQuery(selectStatement)) {
+                        if (rs.next()) {
+                            _assertionFailed = true;
+                            rows.append(title + "\n");
+                            for (String column : columns) {
+                                rows.append(column).append('|');
                             }
                             rows.setCharAt(rows.length() - 1, '\n');
-                        } while (rs.next());
-                        fail(rows.toString());
+                            do {
+                                for (int i = 1; i <= columns.size(); i++) {
+                                    rows.append(rs.getString(i)).append('|');
+                                }
+                                rows.setCharAt(rows.length() - 1, '\n');
+                            } while (rs.next());
+                        }
+                        return _assertionFailed;
+                    } catch (SQLException e) {
+                        throw new RuntimeException(e);
                     }
+                };
+                boolean assertionFailed =
+                        t.apply("Rows missing in trigger materialized table").apply(sbMissingRows.toString()) ||
+                        t.apply("Rows stale in trigger materialized table").apply(sbStaleRows.toString());
+
+                if (assertionFailed) {
+                    fail(rows.toString());
                 }
             }
         } catch (Exception ex) {
