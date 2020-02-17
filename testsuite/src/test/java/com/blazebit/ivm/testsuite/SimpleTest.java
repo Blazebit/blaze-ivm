@@ -26,7 +26,7 @@ public class SimpleTest extends MaterializationTest {
     }
 
     @Test
-    public void simpleTest() {
+    public void simpleInsertTest() {
         // Given
         Order order = new Order();
         Article article = new Article();
@@ -49,6 +49,37 @@ public class SimpleTest extends MaterializationTest {
         // When
         Order newOrder = new Order();
         em.persist(newOrder);
+        em.flush();
+
+        // Then
+        assertMaterializationEqual();
+    }
+
+    @Test
+    public void simpleDeleteTest() {
+        // Given
+        Order order1 = new Order();
+        Order order2 = new Order();
+        Article article = new Article();
+        article.setName("Article 1");
+        em.persist(order1);
+        em.persist(order2);
+        em.persist(article);
+        OrderPosition orderPosition = new OrderPosition();
+        orderPosition.setArticle(article);
+        orderPosition.setOrder(order1);
+        em.persist(orderPosition);
+        em.flush();
+
+        // create view
+        String viewQuery = "SELECT art.id as art_id, ord.id as ord_id, art.name, ordpos.amount FROM _order ord " +
+            "LEFT JOIN order_position ordpos ON ordpos.order_id = ord.id " +
+            "LEFT JOIN article art ON art.id = ordpos.article_id " +
+            "WHERE ord.id > 0";
+        Map<String, TriggerBasedIvmStrategy.TriggerDefinition> triggerDefinitions = setupMaterialization(viewQuery);
+
+        // When
+        em.remove(order2);
         em.flush();
 
         // Then

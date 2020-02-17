@@ -44,6 +44,7 @@ import org.apache.calcite.sql.SqlJoin;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.SqlNodeList;
 import org.apache.calcite.sql.SqlSelect;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParser;
@@ -68,6 +69,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 
 /**
  *
@@ -303,23 +305,64 @@ public class TriggerBasedIvmStrategy {
             }
         });
 
-        SqlNode from = ((SqlSelect) newSqlNode).getFrom();
-        SqlIdentifier rootAlias;
-        while (from instanceof SqlJoin) {
-            from = ((SqlJoin) from).getLeft();
+
+        SqlSelect deleteDeltaQuery = (SqlSelect) newSqlNode;
+        SqlSelect insertDeltaQuery = (SqlSelect) deleteDeltaQuery.accept(new SqlShuttle() {
+            @Override
+            public SqlNode visit(SqlIdentifier id) {
+                return id.clone(id.getParserPosition());
+            }
+        });
+        prepareDeleteDeltaQuery(deleteDeltaQuery);
+        prepareInsertDeltaQuery(insertDeltaQuery);
+
+        sb.append("IF TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN\n");
+        sb.append("CREATE TEMPORARY TABLE _delta1 AS ");
+
+        sb.append(new SqlPrettyWriter(dialect).format(deleteDeltaQuery));
+        // DELETE
+        sb.append(";\nDELETE FROM ")
+                .append(materializationTableName)
+                .append(" a WHERE EXISTS(SELECT 1 FROM _delta1 d WHERE (");
+
+        List<String> fieldNames = materializationTable.getRowType(rexBuilder.getTypeFactory()).getFieldNames();
+        for (String fieldName : fieldNames) {
+            sb.append("a.").append(fieldName).append(',');
         }
-        if (from instanceof SqlIdentifier) {
-            rootAlias = (SqlIdentifier) from;
-        } else if (from instanceof SqlBasicCall && ((SqlBasicCall) from).getOperator().getKind() == SqlKind.AS) {
-            rootAlias = (SqlIdentifier) ((SqlBasicCall) from).getOperands()[1];
-        } else {
-            throw new IllegalArgumentException("Can't extract alias from node: " + from);
+        sb.setCharAt(sb.length() - 1, ')');
+        sb.append(" IS NOT DISTINCT FROM (");
+        for (String fieldName : fieldNames) {
+            sb.append("d.").append(fieldName).append(',');
         }
+        sb.setCharAt(sb.length() - 1, ')');
+        sb.append(")");
+
+        sb.append(";\nEND IF;\n");
+
+
+        sb.append("IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN\n");
+        sb.append("CREATE TEMPORARY TABLE _delta1 AS ");
+
+        sb.append(new SqlPrettyWriter(dialect).format(insertDeltaQuery));
+        // INSERT
+        sb.append(";\nINSERT INTO ").append(materializationTableName).append("(");
+        for (String fieldName : fieldNames) {
+            sb.append(fieldName).append(',');
+        }
+        sb.setCharAt(sb.length() - 1, ')');
+        sb.append(" SELECT ");
+        sb.append("*");
+        sb.append(" FROM _delta1 a");
+        sb.append(";\nEND IF;\n");
+    }
+
+    private void prepareInsertDeltaQuery(SqlSelect deltaQuery) {
+        SqlIdentifier rootAlias = resolveRootAlias(deltaQuery);
         List<String> keyColumns = Arrays.asList("ctid");
         for (String keyColumn : keyColumns) {
-            ((SqlSelect) newSqlNode).setWhere(
+            deltaQuery.setWhere(
                     new SqlBasicCall(SqlStdOperatorTable.AND, new SqlNode[]{
-                        ((SqlSelect) newSqlNode).getWhere() == null ? SqlLiteral.createBoolean(true, from.getParserPosition()) : ((SqlSelect) newSqlNode).getWhere(),
+                        deltaQuery.getWhere() == null ? SqlLiteral.createBoolean(true, deltaQuery.getFrom().getParserPosition()) : deltaQuery.getWhere(),
                         new SqlBasicCall(SqlStdOperatorTable.EQUALS, new SqlNode[]{
                             rootAlias.plus(keyColumn, SqlParserPos.ZERO),
 
@@ -331,30 +374,55 @@ public class TriggerBasedIvmStrategy {
                     }, SqlParserPos.ZERO)
             );
         }
+    }
 
-        sb.append("CREATE TEMPORARY TABLE _delta1 AS ");
-
-        sb.append(new SqlPrettyWriter(dialect).format(newSqlNode));
-
-        sb.append(";\nIF TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN\n");
-        // DELETE
-        sb.append("DELETE FROM ").append(materializationTableName).append(" a WHERE 1=0");
-
-        sb.append(";\nEND IF;\n");
-
-
-        sb.append("IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN\n");
-        // INSERT
-        sb.append("INSERT INTO ").append(materializationTableName).append("(");
-        List<String> fieldNames = materializationTable.getRowType(rexBuilder.getTypeFactory()).getFieldNames();
-        for (String fieldName : fieldNames) {
-            sb.append(fieldName).append(',');
+    private void prepareDeleteDeltaQuery(SqlSelect select) {
+        SqlNode from = select.getFrom();
+        SqlJoin fromParent = null;
+        while (from instanceof SqlJoin) {
+            fromParent = (SqlJoin) from;
+            from = ((SqlJoin) from).getLeft();
         }
-        sb.setCharAt(sb.length() - 1, ')');
-        sb.append(" SELECT ");
-        sb.append("*");
-        sb.append(" FROM _delta1 a");
-        sb.append(";\nEND IF;\n");
+        final SqlJoin finalFromParent = fromParent;
+        Consumer<SqlNode> fromModifier = finalFromParent == null ?
+                select::setFrom :
+                finalFromParent::setLeft;
+
+        SqlIdentifier rootTableAlias = resolveRootAlias(from);
+        SqlNode newFrom = new SqlSelect(SqlParserPos.ZERO, null,
+                SqlNodeList.of(new SqlBasicCall(SqlStdOperatorTable.DOT, new SqlNode[] {
+                        SqlLiteral.createSymbol(TransitionTable.OLD, SqlParserPos.ZERO),
+                        SqlIdentifier.star(SqlParserPos.ZERO)
+                }, SqlParserPos.ZERO)),
+                null, null, null, null, null, null, null, null
+        );
+
+        if (rootTableAlias != null) {
+            newFrom = new SqlBasicCall(SqlStdOperatorTable.AS, new SqlNode[] {
+                    newFrom,
+                    rootTableAlias
+            }, SqlParserPos.ZERO);
+        }
+        fromModifier.accept(newFrom);
+    }
+
+    private SqlIdentifier resolveRootAlias(SqlSelect select) {
+        return resolveRootAlias(select.getFrom());
+    }
+
+    private SqlIdentifier resolveRootAlias(SqlNode sqlNode) {
+        SqlIdentifier rootAlias;
+        while (sqlNode instanceof SqlJoin) {
+            sqlNode = ((SqlJoin) sqlNode).getLeft();
+        }
+        if (sqlNode instanceof SqlIdentifier) {
+            rootAlias = (SqlIdentifier) sqlNode;
+        } else if (sqlNode instanceof SqlBasicCall && ((SqlBasicCall) sqlNode).getOperator().getKind() == SqlKind.AS) {
+            rootAlias = (SqlIdentifier) ((SqlBasicCall) sqlNode).getOperands()[1];
+        } else {
+            throw new IllegalArgumentException("Can't extract alias from node: " + sqlNode);
+        }
+        return rootAlias;
     }
 
     private static enum TransitionTable {
