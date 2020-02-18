@@ -17,5 +17,10 @@
             <artifactId>calcite-core</artifactId>
             <version>${version.calcite}</version>
         </dependency>
+        <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+            <version>19.0</version>
+        </dependency>
     </dependencies>
 </project>

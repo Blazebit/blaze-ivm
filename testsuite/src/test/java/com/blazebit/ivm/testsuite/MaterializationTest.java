@@ -76,7 +76,7 @@ public abstract class MaterializationTest extends AbstractHibernatePersistenceTe
             calciteConnection.setSchema(name);
 
             TriggerBasedIvmStrategy triggerBasedIvmStrategy = new TriggerBasedIvmStrategy(calciteConnection, viewQuery, materializationTableName);
-            Map<String, TriggerBasedIvmStrategy.TriggerDefinition> triggerDefinitions = triggerBasedIvmStrategy.generateTriggerDefinitionForBaseTable();
+            Map<String, TriggerBasedIvmStrategy.TriggerDefinition> triggerDefinitions = triggerBasedIvmStrategy.generateTriggerDefinitionForBaseTable(connection);
             for (TriggerBasedIvmStrategy.TriggerDefinition triggerDefinition : triggerDefinitions.values()) {
                 try (Statement statement = connection.createStatement()) {
                     statement.execute(triggerDefinition.getDropScript());

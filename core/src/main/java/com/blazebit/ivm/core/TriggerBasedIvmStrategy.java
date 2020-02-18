@@ -36,31 +36,21 @@ import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.rex.RexVisitorImpl;
 import org.apache.calcite.schema.Table;
 import org.apache.calcite.sql.JoinType;
-import org.apache.calcite.sql.SqlBasicCall;
-import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlDialect;
-import org.apache.calcite.sql.SqlIdentifier;
-import org.apache.calcite.sql.SqlJoin;
-import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
-import org.apache.calcite.sql.SqlNodeList;
-import org.apache.calcite.sql.SqlSelect;
-import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParser;
-import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.pretty.SqlPrettyWriter;
-import org.apache.calcite.sql.util.SqlBasicVisitor;
-import org.apache.calcite.sql.util.SqlShuttle;
 import org.apache.calcite.sql.validate.SqlConformanceEnum;
 import org.apache.calcite.tools.FrameworkConfig;
 import org.apache.calcite.tools.Frameworks;
 import org.apache.calcite.tools.RelBuilder;
-import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.calcite.util.Pair;
 
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -69,7 +59,6 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.Consumer;
 
 /**
  *
@@ -81,7 +70,6 @@ public class TriggerBasedIvmStrategy {
     private final FrameworkConfig config;
     private final SqlDialect dialect;
     private final RexBuilder rexBuilder;
-    private final SqlNode sqlNode;
     private final RelRoot relRoot;
     private final String materializationTableName;
     private final Table materializationTable;
@@ -100,7 +88,6 @@ public class TriggerBasedIvmStrategy {
                 .defaultSchema(calciteConnection.getRootSchema().getSubSchema("adhoc"))
                 .build();
             PlannerImpl planner = new PlannerImpl(config);
-            this.sqlNode = SqlParser.create(viewSqlQuery, config.getParserConfig()).parseStmt();
             SqlNode sqlNode = planner.parse(viewSqlQuery);
             planner.validate(sqlNode);
             this.dialect = config.getDefaultSchema().unwrap(JdbcSchema.class).dialect;
@@ -113,7 +100,7 @@ public class TriggerBasedIvmStrategy {
         }
     }
 
-    public Map<String, TriggerDefinition> generateTriggerDefinitionForBaseTable() {
+    public Map<String, TriggerDefinition> generateTriggerDefinitionForBaseTable(Connection connection) {
         // produce join-disjunctive normal form
         Set<Term> normalize = normalize(relRoot.rel);
         // create subsumption graph
@@ -131,35 +118,42 @@ public class TriggerBasedIvmStrategy {
         // - apply indirect delta
 
         Map<String, TriggerDefinition> triggers = new HashMap<>();
-        for (SqlIdentifier tableNameIdentifier : getTables()) {
+        final RelMetadataQuery metadataQuery = relRoot.rel.getCluster().getMetadataQuery();
+        boolean rowTrigger = true;
+        for (RexTableInputRef.RelTableRef tableReference : metadataQuery.getTableReferences(relRoot.rel)) {
             StringBuilder triggerSb = new StringBuilder();
-            String tableName = tableNameIdentifier.toString();
+            String tableName = tableReference.getQualifiedName().get(1);
             String triggerName = tableName + "_trig";
             String triggerFunctionName = tableName + "_trig_fn";
+            List<String> primaryKeyColumnNames = getPrimaryKeyColumns(connection, tableName);
             String dropScript = "DROP TRIGGER IF EXISTS " + triggerName + " ON " + tableName + "; DROP FUNCTION IF EXISTS " + triggerFunctionName + "();";
             triggerSb.append("CREATE FUNCTION ").append(triggerFunctionName).append("() RETURNS trigger AS \n$$\nBEGIN\n");
-            generateTrigger(triggerSb, tableNameIdentifier);
+            generateTrigger(triggerSb, normalize, tableReference.getTable(), rowTrigger, primaryKeyColumnNames);
             triggerSb.append("\nRETURN NEW;");
             triggerSb.append("\nEND;\n$$ LANGUAGE 'plpgsql';\n");
-            triggerSb.append("CREATE TRIGGER ").append(triggerName).append(" AFTER INSERT OR UPDATE OR DELETE ON ").append(tableName).append(" FOR EACH ROW EXECUTE PROCEDURE ").append(triggerFunctionName).append("();");
+            triggerSb.append("CREATE TRIGGER ").append(triggerName).append(" AFTER INSERT OR UPDATE OR DELETE ON ").append(tableName);
+            if (rowTrigger) {
+                triggerSb.append(" FOR EACH ROW EXECUTE PROCEDURE ");
+            } else {
+                triggerSb.append(" FOR EACH STATEMENT EXECUTE PROCEDURE ");
+            }
+            triggerSb.append(triggerFunctionName).append("();");
             triggers.put(tableName, new TriggerDefinition(dropScript, triggerSb.toString()));
         }
-//        final RelMetadataQuery metadataQuery = relRoot.rel.getCluster().getMetadataQuery();
-//        for (RexTableInputRef.RelTableRef tableReference : metadataQuery.getTableReferences(relRoot.rel)) {
-//            StringBuilder triggerSb = new StringBuilder();
-//            String tableName = tableReference.getQualifiedName().get(1);
-//            String triggerName = tableName + "_trig";
-//            String triggerFunctionName = tableName + "_trig_fn";
-//            String dropScript = "DROP TRIGGER IF EXISTS " + triggerName + " ON " + tableName + "; DROP FUNCTION IF EXISTS " + triggerFunctionName + ";";
-//            triggerSb.append("CREATE FUNCTION ").append(triggerFunctionName).append("() RETURNS trigger AS \n$$\nBEGIN\n");
-//            generateTrigger(triggerSb, normalize, tableReference.getTable());
-//            triggerSb.append("\nRETURN NEW;");
-//            triggerSb.append("\nEND;\n$$ LANGUAGE 'plpgsql';\n");
-//            triggerSb.append("CREATE TRIGGER ").append(triggerName).append(" AFTER INSERT OR UPDATE OR DELETE ON ").append(tableName).append(" FOR EACH ROW EXECUTE PROCEDURE ").append(triggerFunctionName).append("();");
-//            triggers.put(tableName, new TriggerDefinition(dropScript, triggerSb.toString()));
-//        }
 
         return triggers;
+    }
+
+    private List<String> getPrimaryKeyColumns(Connection connection, String tableName) {
+        List<String> primaryKeyColumnNames = new ArrayList<>();
+        try (ResultSet rs = connection.getMetaData().getPrimaryKeys(null, null, tableName)) {
+            while (rs.next()) {
+                primaryKeyColumnNames.add(rs.getString("COLUMN_NAME"));
+            }
+        } catch (SQLException ex) {
+            throw new RuntimeException(ex);
+        }
+        return primaryKeyColumnNames;
     }
 
     private static JoinRelType forExcludeRightNullExtended(JoinRelType joinType) {
@@ -189,378 +183,78 @@ public class TriggerBasedIvmStrategy {
         return joinType;
     }
 
-    private Set<SqlIdentifier> getTables() {
-        Set<SqlIdentifier> tables = new HashSet<>();
-        sqlNode.accept(new SqlBasicVisitor<Void>() {
-            @Override
-            public Void visit(SqlCall call) {
-                if (call instanceof SqlSelect) {
-                    SqlNode from = ((SqlSelect) call).getFrom();
-                    if (addSqlIdentifier(from)) {
-                        return null;
-                    } else {
-                        return super.visit(call);
-                    }
-                } else if (call instanceof SqlJoin) {
-                    SqlJoin join = (SqlJoin) call;
-                    if (!addSqlIdentifier(join.getLeft())) {
-                        join.getLeft().accept(this);
-                    }
-                    if (!addSqlIdentifier(join.getRight())) {
-                        join.getRight().accept(this);
-                    }
-                    return join.getCondition().accept(this);
-                } else {
-                    return super.visit(call);
-                }
-            }
+    private void generateTrigger(StringBuilder sb, Set<Term> normalizedTerms, RelOptTable table, boolean rowTrigger, List<String> primaryKeyColumnNames) {
+        RelToSqlConverter relToSqlConverter = new RelToSqlConverter(dialect);
+        SqlPrettyWriter sqlWriter = new SqlPrettyWriter(SqlPrettyWriter.config().withDialect(dialect));
+        String tableName = table.getQualifiedName().get(table.getQualifiedName().size() - 1);
+        String oldTableName = "_old_" + tableName;
+        String newTableName = "_new_" + tableName;
+        String primaryDeltaTableName = "_delta1_" + tableName;
+        List<String> materializationTableFieldNames = materializationTable.getRowType(rexBuilder.getTypeFactory()).getFieldNames();
 
-            private boolean addSqlIdentifier(SqlNode from) {
-                if (from instanceof SqlIdentifier) {
-                    tables.add((SqlIdentifier) from);
-                    return true;
-                } else if (from instanceof SqlBasicCall && ((SqlBasicCall) from).getOperator().getKind() == SqlKind.AS) {
-                    tables.add((SqlIdentifier) ((SqlBasicCall) from).getOperands()[0]);
-                    return true;
-                }
-                return false;
-            }
-        });
-        return tables;
-    }
-
-    private void generateTrigger(StringBuilder sb, SqlIdentifier baseTable) {
-        // Traverse path from the baseTable join to the root and change joins so that baseTable ends up on the very left side
-        // Return new baseTable root join node (left side of this node is the baseTable)
-        SqlNode newSqlNode = sqlNode.accept(new SqlShuttle() {
-            @Override
-            public SqlNode visit(SqlCall call) {
-                if (call instanceof SqlJoin) {
-                    SqlJoin join = (SqlJoin) call;
-                    if (baseTable.equals(getFirstIdentifier(join.getLeft()))) {
-                        SqlLiteral joinType = forExcludeRightNullExtended(join.getJoinTypeNode());
-                        return new SqlJoin(join.getParserPosition(), join.getLeft(), join.isNaturalNode(), joinType, join.getRight(), join.getConditionTypeNode(), join.getCondition());
-                    } else if (baseTable.equals(getFirstIdentifier(join.getRight()))) {
-                        SqlLiteral joinType = forExcludeRightNullExtended(swap(join.getJoinTypeNode()));
-                        return new SqlJoin(join.getParserPosition(), join.getRight(), join.isNaturalNode(), joinType, join.getLeft(), join.getConditionTypeNode(), join.getCondition());
-                    } else {
-                        SqlNode left = join.getLeft().accept(this);
-                        SqlNode right = join.getRight().accept(this);
-                        if (left == join.getLeft()) {
-                            // Nothing changed on the left side
-                            if (right == join.getRight()) {
-                                // Nothing changed, baseTable not referenced in this join
-                                return join;
-                            }
-
-                            // baseTable on the right side, so we have to swap
-                            SqlLiteral joinType = forExcludeRightNullExtended(swap(join.getJoinTypeNode()));
-                            return new SqlJoin(join.getParserPosition(), right, join.isNaturalNode(), joinType, left, join.getConditionTypeNode(), join.getCondition());
-                        } else {
-                            // baseTable on the left side
-                            SqlLiteral newJoinType = forExcludeRightNullExtended(join.getJoinTypeNode());
-                            return new SqlJoin(join.getParserPosition(), left, join.isNaturalNode(), newJoinType, right, join.getConditionTypeNode(), join.getCondition());
-                        }
-                    }
-                } else {
-                    return super.visit(call);
-                }
-            }
-
-            private SqlNode createNewCorrelatedJoinCondition(SqlNode condition, SqlNode node) {
-                // TODO: the ctid condition needs to go into the where clause.
-                SqlIdentifier alias;
-                if (node instanceof SqlIdentifier) {
-                    alias = (SqlIdentifier) node;
-                } else if (node instanceof SqlBasicCall && ((SqlBasicCall) node).getOperator().getKind() == SqlKind.AS) {
-                    alias = (SqlIdentifier) ((SqlBasicCall) node).getOperands()[1];
-                } else {
-                    throw new IllegalArgumentException("Can't extract alias from node: " + node);
-                }
-                List<String> keyColumns = Arrays.asList("ctid");
-                for (String keyColumn : keyColumns) {
-                    condition = new SqlBasicCall(SqlStdOperatorTable.AND, new SqlNode[]{
-                        condition,
-                        new SqlBasicCall(SqlStdOperatorTable.EQUALS, new SqlNode[]{
-                            alias.plus(keyColumn, SqlParserPos.ZERO),
-
-                            new SqlBasicCall(SqlStdOperatorTable.DOT, new SqlNode[]{
-                                SqlLiteral.createSymbol(TransitionTable.NEW, SqlParserPos.ZERO),
-                                new SqlIdentifier(ImmutableList.of(keyColumn), SqlParserPos.ZERO)
-                            }, SqlParserPos.ZERO)
-                        }, SqlParserPos.ZERO)
-                    }, SqlParserPos.ZERO);
-                }
-
-                return condition;
-            }
-
-            private SqlIdentifier getFirstIdentifier(SqlNode node) {
-                if (node instanceof SqlIdentifier) {
-                    return (SqlIdentifier) node;
-                } else if (node instanceof SqlBasicCall && ((SqlBasicCall) node).getOperator().getKind() == SqlKind.AS) {
-                    return (SqlIdentifier) ((SqlBasicCall) node).getOperands()[0];
-                }
-                return null;
-            }
-        });
-
-
-        SqlSelect deleteDeltaQuery = (SqlSelect) newSqlNode;
-        SqlSelect insertDeltaQuery = (SqlSelect) deleteDeltaQuery.accept(new SqlShuttle() {
-            @Override
-            public SqlNode visit(SqlIdentifier id) {
-                return id.clone(id.getParserPosition());
-            }
-        });
-        prepareDeleteDeltaQuery(deleteDeltaQuery);
-        prepareInsertDeltaQuery(insertDeltaQuery);
-
-        sb.append("IF TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN\n");
-        sb.append("CREATE TEMPORARY TABLE _delta1 AS ");
-
-        sb.append(new SqlPrettyWriter(dialect).format(deleteDeltaQuery));
         // DELETE
-        sb.append(";\nDELETE FROM ")
+        {
+            RelNode deletePrimaryDelta = relRoot.rel.accept(new DeletePrimaryDeltaVisitor(config, rexBuilder, table, primaryKeyColumnNames, oldTableName));
+
+            sb.append("IF TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN\n");
+            if (rowTrigger) {
+                sb.append("DROP TABLE IF EXISTS ").append(oldTableName).append(";\n");
+            }
+            sb.append("DROP TABLE IF EXISTS ").append(primaryDeltaTableName).append(";\n");
+            sb.append("CREATE TEMPORARY TABLE ").append(oldTableName).append(" AS\nSELECT OLD.* FROM (VALUES(1)) _;\n");
+            sb.append("CREATE TEMPORARY TABLE ").append(primaryDeltaTableName).append(" AS \n");
+
+            SqlImplementor.Result deleteResult = relToSqlConverter.visitChild(0, deletePrimaryDelta);
+            sqlWriter.reset();
+            sb.append(sqlWriter.format(deleteResult.asSelect()));
+            sb.append(";\n");
+
+            sb.append("DELETE FROM ")
                 .append(materializationTableName)
-                .append(" a WHERE EXISTS(SELECT 1 FROM _delta1 d WHERE (");
+                .append(" a WHERE EXISTS(SELECT 1 FROM ").append(primaryDeltaTableName).append(" d WHERE (");
 
-        List<String> fieldNames = materializationTable.getRowType(rexBuilder.getTypeFactory()).getFieldNames();
-        for (String fieldName : fieldNames) {
-            sb.append("a.").append(fieldName).append(',');
+            for (String fieldName : materializationTableFieldNames) {
+                sb.append("a.").append(fieldName).append(',');
+            }
+            sb.setCharAt(sb.length() - 1, ')');
+            sb.append(" IS NOT DISTINCT FROM (");
+            for (String fieldName : materializationTableFieldNames) {
+                sb.append("d.").append(fieldName).append(',');
+            }
+            sb.setCharAt(sb.length() - 1, ')');
+            sb.append(")");
+
+            sb.append(";\nEND IF;\n");
         }
-        sb.setCharAt(sb.length() - 1, ')');
-        sb.append(" IS NOT DISTINCT FROM (");
-        for (String fieldName : fieldNames) {
-            sb.append("d.").append(fieldName).append(',');
-        }
-        sb.setCharAt(sb.length() - 1, ')');
-        sb.append(")");
 
-        sb.append(";\nEND IF;\n");
-
-
-        sb.append("IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN\n");
-        sb.append("CREATE TEMPORARY TABLE _delta1 AS ");
-
-        sb.append(new SqlPrettyWriter(dialect).format(insertDeltaQuery));
         // INSERT
-        sb.append(";\nINSERT INTO ").append(materializationTableName).append("(");
-        for (String fieldName : fieldNames) {
-            sb.append(fieldName).append(',');
-        }
-        sb.setCharAt(sb.length() - 1, ')');
-        sb.append(" SELECT ");
-        sb.append("*");
-        sb.append(" FROM _delta1 a");
-        sb.append(";\nEND IF;\n");
-    }
+        {
+            RelNode insertPrimaryDelta = relRoot.rel.accept(new InsertPrimaryDeltaVisitor(config, rexBuilder, table, primaryKeyColumnNames, newTableName));
 
-    private void prepareInsertDeltaQuery(SqlSelect deltaQuery) {
-        SqlIdentifier rootAlias = resolveRootAlias(deltaQuery);
-        List<String> keyColumns = Arrays.asList("ctid");
-        for (String keyColumn : keyColumns) {
-            deltaQuery.setWhere(
-                    new SqlBasicCall(SqlStdOperatorTable.AND, new SqlNode[]{
-                        deltaQuery.getWhere() == null ? SqlLiteral.createBoolean(true, deltaQuery.getFrom().getParserPosition()) : deltaQuery.getWhere(),
-                        new SqlBasicCall(SqlStdOperatorTable.EQUALS, new SqlNode[]{
-                            rootAlias.plus(keyColumn, SqlParserPos.ZERO),
-
-                            new SqlBasicCall(SqlStdOperatorTable.DOT, new SqlNode[]{
-                                SqlLiteral.createSymbol(TransitionTable.NEW, SqlParserPos.ZERO),
-                                new SqlIdentifier(ImmutableList.of(keyColumn), SqlParserPos.ZERO)
-                            }, SqlParserPos.ZERO)
-                        }, SqlParserPos.ZERO)
-                    }, SqlParserPos.ZERO)
-            );
-        }
-    }
-
-    private void prepareDeleteDeltaQuery(SqlSelect select) {
-        SqlNode from = select.getFrom();
-        SqlJoin fromParent = null;
-        while (from instanceof SqlJoin) {
-            fromParent = (SqlJoin) from;
-            from = ((SqlJoin) from).getLeft();
-        }
-        final SqlJoin finalFromParent = fromParent;
-        Consumer<SqlNode> fromModifier = finalFromParent == null ?
-                select::setFrom :
-                finalFromParent::setLeft;
-
-        SqlIdentifier rootTableAlias = resolveRootAlias(from);
-        SqlNode newFrom = new SqlSelect(SqlParserPos.ZERO, null,
-                SqlNodeList.of(new SqlBasicCall(SqlStdOperatorTable.DOT, new SqlNode[] {
-                        SqlLiteral.createSymbol(TransitionTable.OLD, SqlParserPos.ZERO),
-                        SqlIdentifier.star(SqlParserPos.ZERO)
-                }, SqlParserPos.ZERO)),
-                null, null, null, null, null, null, null, null
-        );
-
-        if (rootTableAlias != null) {
-            newFrom = new SqlBasicCall(SqlStdOperatorTable.AS, new SqlNode[] {
-                    newFrom,
-                    rootTableAlias
-            }, SqlParserPos.ZERO);
-        }
-        fromModifier.accept(newFrom);
-    }
-
-    private SqlIdentifier resolveRootAlias(SqlSelect select) {
-        return resolveRootAlias(select.getFrom());
-    }
-
-    private SqlIdentifier resolveRootAlias(SqlNode sqlNode) {
-        SqlIdentifier rootAlias;
-        while (sqlNode instanceof SqlJoin) {
-            sqlNode = ((SqlJoin) sqlNode).getLeft();
-        }
-        if (sqlNode instanceof SqlIdentifier) {
-            rootAlias = (SqlIdentifier) sqlNode;
-        } else if (sqlNode instanceof SqlBasicCall && ((SqlBasicCall) sqlNode).getOperator().getKind() == SqlKind.AS) {
-            rootAlias = (SqlIdentifier) ((SqlBasicCall) sqlNode).getOperands()[1];
-        } else {
-            throw new IllegalArgumentException("Can't extract alias from node: " + sqlNode);
-        }
-        return rootAlias;
-    }
-
-    private static enum TransitionTable {
-        OLD,
-        NEW;
-
-        @Override
-        public String toString() {
-            return name() + ".";
-        }
-    }
-
-    private void generateTrigger(StringBuilder sb, Set<Term> normalizedTerms, RelOptTable table) {
-        // The most important step here is to move the table T to the left
-        // In addition, we rewrite joins to exclude null-extended tuples
-//        LogicalTableScan logicalTableScan = LogicalTableScan.create(relRoot.rel.getCluster(), RelOptTableImpl.create(table.getRelOptSchema(), table.getRowType(), table.unwrap(Table.class), ImmutableList.of("NEW")));
-//        SqlOperator sqlOperator = rexBuilder.getOpTab().getOperatorList().stream().filter(o -> "=".equals(o.getName())).findFirst().get();
-        RelNode deltaVDRelNode = relRoot.rel.accept(new RelShuttleImpl() {
-            @Override
-            public RelNode visit(LogicalJoin join) {
-                // For vD we only care about non-null extending tuples, so we transform joins to exclude null extended tuples
-                if (table.equals(join.getLeft().getTable())) {
-                    JoinRelType joinType = forExcludeRightNullExtended(join.getJoinType());
-                    return join.copy(join.getTraitSet(), createNewCorrelatedJoinCondition(join, join.getLeft()), join.getLeft(), join.getRight(), joinType, join.isSemiJoinDone());
-                } else if (table.equals(join.getRight().getTable())) {
-                    return swap(join.copy(join.getTraitSet(), createNewCorrelatedJoinCondition(join, join.getRight()), join.getLeft(), join.getRight(), join.getJoinType(), join.isSemiJoinDone()));
-                } else {
-                    RelNode left = join.getLeft().accept(this);
-                    RelNode right = join.getRight().accept(this);
-                    if (left == join.getLeft()) {
-                        // Nothing changed on the left side
-                        if (right == join.getRight()) {
-                            // Nothing changed, no source table in this join
-                            return join;
-                        }
-
-                        // Source table on the right side, so we have to swap
-                        return swap(join.copy(join.getTraitSet(), join.getCondition(), left, right, join.getJoinType(), join.isSemiJoinDone()));
-                    } else {
-                        // The left side contains the source table
-                        JoinRelType newJoinType = forExcludeRightNullExtended(join.getJoinType());
-                        return join.copy(join.getTraitSet(), join.getCondition(), left, right, newJoinType, join.isSemiJoinDone());
-                    }
-                }
+            sb.append("IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN\n");
+            if (rowTrigger) {
+                sb.append("DROP TABLE IF EXISTS ").append(newTableName).append(";\n");
             }
+            sb.append("DROP TABLE IF EXISTS ").append(primaryDeltaTableName).append(";\n");
+            sb.append("CREATE TEMPORARY TABLE ").append(newTableName).append(" AS\nSELECT NEW.* FROM (VALUES(1)) _;\n");
+            sb.append("CREATE TEMPORARY TABLE ").append(primaryDeltaTableName).append(" AS \n");
 
-            private RexNode createNewCorrelatedJoinCondition(LogicalJoin join, RelNode node) {
-                Set<ImmutableBitSet> uniqueKeys = node.getCluster().getMetadataQuery().getUniqueKeys(node);
-                ImmutableBitSet uniqueFieldBitSet;
-                if (uniqueKeys == null) {
-                    // TODO: currently calcite doesn't seem to support access to uniqueness metadata
-                    uniqueFieldBitSet = ImmutableBitSet.of(0);
-                } else {
-                    uniqueFieldBitSet = uniqueKeys.iterator().next();
-                }
-                List<RelDataTypeField> fieldList = node.getRowType().getFieldList();
-                RelBuilder relBuilder = RelBuilder.create(config);
-                RexNode condition = join.getCondition();
-                List<RexNode> conjuncts = new ArrayList<>(uniqueFieldBitSet.size() + 1);
-                conjuncts.add(condition);
+            SqlImplementor.Result insertResult = relToSqlConverter.visitChild(0, insertPrimaryDelta);
+            sqlWriter.reset();
+            sb.append(sqlWriter.format(insertResult.asSelect()));
+            sb.append(";\n");
 
-                for (Integer index : uniqueFieldBitSet) {
-                    relBuilder.push(join);
-                    conjuncts.add(
-                        relBuilder.equals(
-                            relBuilder.field(fieldList.get(index).getName()),
-                            relBuilder.transientScan("NEW", join.getRowType()).field(fieldList.get(index).getName())
-                        )
-                    );
-                }
-                return RexUtil.composeConjunction(rexBuilder, conjuncts);
+            sb.append("INSERT INTO ").append(materializationTableName).append("(");
+            for (String fieldName : materializationTableFieldNames) {
+                sb.append(fieldName).append(',');
             }
+            sb.setCharAt(sb.length() - 1, ')');
+            sb.append("\nSELECT ");
+            sb.append("*");
+            sb.append(" FROM ").append(primaryDeltaTableName).append(" a");
 
-            private RelNode swap(LogicalJoin join) {
-                RelNode relNode = JoinCommuteRule.swap(join, true, RelBuilder.create(config));
-                if (relNode instanceof LogicalProject) {
-                    join = (LogicalJoin) relNode.getInput(0);
-                } else {
-                    join = (LogicalJoin) relNode;
-                }
-                JoinRelType joinType = forExcludeRightNullExtended(join.getJoinType());
-                if (joinType != join.getJoinType()) {
-                    join = join.copy(join.getTraitSet(), join.getCondition(), join.getLeft(), join.getRight(), joinType, join.isSemiJoinDone());
-                }
-                if (relNode instanceof LogicalProject) {
-                    LogicalProject logicalProject = (LogicalProject) relNode;
-                    List<RexNode> projects = new ArrayList<>(logicalProject.getProjects().size());
-                    List<RelDataTypeField> projectFieldList = logicalProject.getRowType().getFieldList();
-                    List<RelDataTypeField> fieldList = join.getRowType().getFieldList();
-                    List<RelDataTypeField> projectTypeList = new ArrayList<>();
-                    List<RexNode> logicalProjectProjects = logicalProject.getProjects();
-                    for (int i = 0; i < logicalProjectProjects.size(); i++) {
-                        RexNode project = logicalProjectProjects.get(i);
-                        RelDataTypeField projectDataTypeField = projectFieldList.get(i);
-                        RexNode newProject = project.accept(new RexShuttle() {
-                            @Override
-                            public RexNode visitInputRef(RexInputRef inputRef) {
-                                return new RexInputRef(inputRef.getIndex(), fieldList.get(inputRef.getIndex()).getType());
-                            }
-                        });
-
-                        projectTypeList.add(new RelDataTypeFieldImpl(projectDataTypeField.getName(), projectDataTypeField.getIndex(), newProject.getType()));
-                        projects.add(newProject);
-                    }
-
-
-                    relNode = logicalProject.copy(logicalProject.getTraitSet(), join, projects, new RelRecordType(projectTypeList));
-                } else {
-                    relNode = join;
-                }
-                return relNode;
-            }
-        });
-
-        sb.append("CREATE TEMPORARY TABLE _delta1 AS ");
-
-        SqlImplementor.Result result = new RelToSqlConverter(dialect).visitChild(0, deltaVDRelNode);
-        sb.append(new SqlPrettyWriter(dialect).format(result.asSelect()));
-//        new SqlPrettyWriter(dialect).format(table.unwrap(JdbcTable.class).tableName().getComponent(1));
-        sb.append("IF OLD IS NOT NULL THEN\n");
-        // DELETE
-        sb.append("DELETE FROM ").append(materializationTableName).append(" a WHERE ");
-
-        sb.append(";\nEND IF;\n");
-
-
-        sb.append("IF NEW IS NOT NULL THEN\n");
-        // INSERT
-        sb.append("INSERT INTO ").append(materializationTableName).append("(");
-        List<String> fieldNames = materializationTable.getRowType(rexBuilder.getTypeFactory()).getFieldNames();
-        for (String fieldName : fieldNames) {
-            sb.append(fieldName).append(',');
+            sb.append(";\nEND IF;\n");
         }
-        sb.setCharAt(sb.length() - 1, ')');
-        sb.append(" SELECT ");
-
-        sb.append(" FROM (VALUES(1)) a");
-        sb.append(";\nEND IF;\n");
     }
 
     public static class TriggerDefinition {
@@ -850,6 +544,165 @@ public class TriggerBasedIvmStrategy {
             newEc.cacheEquivalenceClassesMap = null;
             newEc.cacheEquivalenceClasses = null;
             return newEc;
+        }
+    }
+
+    private abstract static class PrimaryDeltaVisitor extends RelShuttleImpl {
+
+        protected final RelOptTable table;
+        protected final List<String> primaryKeyColumnNames;
+        protected final String transitionTableName;
+        protected FrameworkConfig config;
+        protected RexBuilder rexBuilder;
+
+        public PrimaryDeltaVisitor(FrameworkConfig config, RexBuilder rexBuilder, RelOptTable table, List<String> primaryKeyColumnNames, String transitionTableName) {
+            this.table = table;
+            this.primaryKeyColumnNames = primaryKeyColumnNames;
+            this.transitionTableName = transitionTableName;
+            this.config = config;
+            this.rexBuilder = rexBuilder;
+        }
+
+        protected RelNode visitChild(RelNode parent, int i, RelNode child) {
+            stack.push(parent);
+            try {
+                RelNode child2 = child.accept(this);
+                if (child2 != child) {
+                    if (parent instanceof LogicalProject) {
+                        return adaptProjectType((LogicalProject) parent, child2);
+                    } else {
+                        final List<RelNode> newInputs = new ArrayList<>(parent.getInputs());
+                        newInputs.set(i, child2);
+                        return parent.copy(parent.getTraitSet(), newInputs);
+                    }
+                }
+                return parent;
+            } finally {
+                stack.pop();
+            }
+        }
+
+        @Override
+        public RelNode visit(LogicalJoin join) {
+            // The most important step here is to move the table T to the left
+            // In addition, we rewrite joins to exclude null-extended tuples
+            
+            // For vD we only care about non-null extending tuples, so we transform joins to exclude null extended tuples
+            if (table.equals(join.getLeft().getTable())) {
+                JoinRelType joinType = forExcludeRightNullExtended(join.getJoinType());
+                return join.copy(join.getTraitSet(), join.getCondition(), correlateJoinWithTransitionTable(join.getLeft()), join.getRight(), joinType, join.isSemiJoinDone());
+            } else if (table.equals(join.getRight().getTable())) {
+                return swap(join.copy(join.getTraitSet(), join.getCondition(), join.getLeft(), correlateJoinWithTransitionTable(join.getRight()), join.getJoinType(), join.isSemiJoinDone()));
+            } else {
+                RelNode left = join.getLeft().accept(this);
+                RelNode right = join.getRight().accept(this);
+                if (left == join.getLeft()) {
+                    // Nothing changed on the left side
+                    if (right == join.getRight()) {
+                        // Nothing changed, no source table in this join
+                        return join;
+                    }
+
+                    // Source table on the right side, so we have to swap
+                    return swap(join.copy(join.getTraitSet(), join.getCondition(), left, right, join.getJoinType(), join.isSemiJoinDone()));
+                } else {
+                    // The left side contains the source table
+                    JoinRelType newJoinType = forExcludeRightNullExtended(join.getJoinType());
+                    return join.copy(join.getTraitSet(), join.getCondition(), left, right, newJoinType, join.isSemiJoinDone());
+                }
+            }
+        }
+
+        protected abstract RelNode correlateJoinWithTransitionTable(RelNode node);
+
+        private RelNode swap(LogicalJoin join) {
+            RelNode relNode = JoinCommuteRule.swap(join, true, RelBuilder.create(config));
+            if (relNode instanceof LogicalProject) {
+                join = (LogicalJoin) relNode.getInput(0);
+            } else {
+                join = (LogicalJoin) relNode;
+            }
+            JoinRelType joinType = forExcludeRightNullExtended(join.getJoinType());
+            if (joinType != join.getJoinType()) {
+                join = join.copy(join.getTraitSet(), join.getCondition(), join.getLeft(), join.getRight(), joinType, join.isSemiJoinDone());
+            }
+            if (relNode instanceof LogicalProject) {
+                relNode = adaptProjectType((LogicalProject) relNode, join);
+            } else {
+                relNode = join;
+            }
+            return relNode;
+        }
+
+        private RelNode adaptProjectType(LogicalProject logicalProject, RelNode newInput) {
+            List<RexNode> projects = new ArrayList<>(logicalProject.getProjects().size());
+            List<RelDataTypeField> projectFieldList = logicalProject.getRowType().getFieldList();
+            List<RelDataTypeField> fieldList = newInput.getRowType().getFieldList();
+            List<RelDataTypeField> projectTypeList = new ArrayList<>();
+            List<RexNode> logicalProjectProjects = logicalProject.getProjects();
+            for (int i = 0; i < logicalProjectProjects.size(); i++) {
+                RexNode project = logicalProjectProjects.get(i);
+                RelDataTypeField projectDataTypeField = projectFieldList.get(i);
+                RexNode newProject = project.accept(new RexShuttle() {
+                    @Override
+                    public RexNode visitInputRef(RexInputRef inputRef) {
+                        return new RexInputRef(inputRef.getIndex(), fieldList.get(inputRef.getIndex()).getType());
+                    }
+                });
+
+                projectTypeList.add(new RelDataTypeFieldImpl(projectDataTypeField.getName(), projectDataTypeField.getIndex(), newProject.getType()));
+                projects.add(newProject);
+            }
+
+
+            return logicalProject.copy(logicalProject.getTraitSet(), newInput, projects, new RelRecordType(projectTypeList));
+        }
+    }
+
+    private static class DeletePrimaryDeltaVisitor extends PrimaryDeltaVisitor {
+
+        public DeletePrimaryDeltaVisitor(FrameworkConfig config, RexBuilder rexBuilder, RelOptTable table, List<String> primaryKeyColumnNames, String transitionTableName) {
+            super(config, rexBuilder, table, primaryKeyColumnNames, transitionTableName);
+        }
+
+        protected RelNode correlateJoinWithTransitionTable(RelNode node) {
+            RelBuilder relBuilder = RelBuilder.create(config);
+            return relBuilder.transientScan(transitionTableName, node.getRowType()).build();
+        }
+    }
+
+    private static class InsertPrimaryDeltaVisitor extends PrimaryDeltaVisitor {
+
+        public InsertPrimaryDeltaVisitor(FrameworkConfig config, RexBuilder rexBuilder, RelOptTable table, List<String> primaryKeyColumnNames, String transitionTableName) {
+            super(config, rexBuilder, table, primaryKeyColumnNames, transitionTableName);
+        }
+
+        protected RelNode correlateJoinWithTransitionTable(RelNode node) {
+            RelBuilder relBuilder = RelBuilder.create(config);
+            List<RexNode> nodeFields = new ArrayList<>(primaryKeyColumnNames.size());
+            List<RexNode> transitionFields = new ArrayList<>(primaryKeyColumnNames.size());
+            List<RexNode> conjuncts = new ArrayList<>(primaryKeyColumnNames.size());
+            relBuilder.push(node);
+            for (String columnName : primaryKeyColumnNames) {
+                nodeFields.add(relBuilder.field(1, 0, columnName));
+            }
+            relBuilder.transientScan(transitionTableName, node.getRowType());
+            for (String columnName : primaryKeyColumnNames) {
+                transitionFields.add(relBuilder.field(2, 1, columnName));
+            }
+
+            for (int i = 0; i < primaryKeyColumnNames.size(); i++) {
+                conjuncts.add(relBuilder.equals(nodeFields.get(i), transitionFields.get(i)));
+            }
+            relBuilder.join(JoinRelType.INNER, RexUtil.composeConjunction(rexBuilder, conjuncts));
+
+            List<RexNode> fields = new ArrayList<>();
+            for (RelDataTypeField field : node.getRowType().getFieldList()) {
+                fields.add(relBuilder.field(field.getName()));
+            }
+
+            relBuilder.project(fields);
+            return relBuilder.build();
         }
     }
 }
