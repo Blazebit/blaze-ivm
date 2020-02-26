@@ -24,6 +24,14 @@ public class OrderPosition {
     private Integer sortIndex;
     private Integer amount;
 
+    public OrderPosition() {
+    }
+
+    public OrderPosition(Order order, Article article) {
+        setOrder(order);
+        setArticle(article);
+    }
+
     @EmbeddedId
     public Id getId() {
         return id;

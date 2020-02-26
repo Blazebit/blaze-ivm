@@ -207,21 +207,24 @@ public class TriggerBasedIvmStrategy {
         // DELETE
         {
             RelNode deletePrimaryDelta = relRoot.rel.accept(new DeletePrimaryDeltaVisitor(config, rexBuilder, sourceTable, primaryKeyColumnNames, materializationTable, oldTableName));
+            RelNode deleteSecondaryDelta = relRoot.rel.accept(new SecondaryDeltaVisitor(config, rexBuilder, sourceTable, primaryKeyColumnNames, materializationTable, newTableName));
+            deleteSecondaryDelta = deleteSecondaryDelta.accept(new DeleteSecondaryDeltaVisitor(config, rexBuilder, sourceTable, primaryKeyColumnNames, materializationTable, oldTableName, primaryDeltaTableName));
 
             sb.append("IF TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN\n");
             if (rowTrigger) {
-                sb.append("DROP TABLE IF EXISTS ").append(oldTableName).append(";\n");
+                sb.append("\tDROP TABLE IF EXISTS ").append(oldTableName).append(";\n");
             }
-            sb.append("DROP TABLE IF EXISTS ").append(primaryDeltaTableName).append(";\n");
-            sb.append("CREATE TEMPORARY TABLE ").append(oldTableName).append(" AS\nSELECT OLD.* FROM (VALUES(1)) _;\n");
-            sb.append("CREATE TEMPORARY TABLE ").append(primaryDeltaTableName).append(" AS \n");
+            sb.append("\tDROP TABLE IF EXISTS ").append(primaryDeltaTableName).append(";\n");
+            sb.append("\tCREATE TEMPORARY TABLE ").append(oldTableName).append(" AS\n\tSELECT OLD.* FROM (VALUES(1)) _;\n");
+            sb.append("\tCREATE TEMPORARY TABLE ").append(primaryDeltaTableName).append(" AS \n");
 
             SqlImplementor.Result deleteResult = relToSqlConverter.visitChild(0, deletePrimaryDelta);
             sqlWriter.reset();
             sb.append(sqlWriter.format(deleteResult.asSelect()));
-            sb.append(";\n");
+            sb.append(";\n\n");
 
-            sb.append("DELETE FROM ")
+            // Primary delta
+            sb.append("\tDELETE FROM ")
                 .append(materializationTableName)
                 .append(" a WHERE EXISTS(SELECT 1 FROM ").append(primaryDeltaTableName).append(" d WHERE (");
 
@@ -234,9 +237,20 @@ public class TriggerBasedIvmStrategy {
                 sb.append("d.").append(fieldName).append(',');
             }
             sb.setCharAt(sb.length() - 1, ')');
-            sb.append(");\n");
+            sb.append(");\n\n");
 
-            sb.append("END IF;\n");
+            // Secondary delta
+            sb.append("INSERT INTO ").append(materializationTableName).append("(");
+            for (String fieldName : materializationTableFieldNames) {
+                sb.append(fieldName).append(',');
+            }
+            sb.setCharAt(sb.length() - 1, ')');
+            sb.append("\n");
+            sqlWriter.reset();
+            sb.append(sqlWriter.format(relToSqlConverter.visitChild(0, deleteSecondaryDelta).asStatement()));
+            sb.append(";\n\n");
+
+            sb.append("END IF;\n\n");
         }
 
         // INSERT
@@ -248,40 +262,31 @@ public class TriggerBasedIvmStrategy {
 
             sb.append("IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN\n");
             if (rowTrigger) {
-                sb.append("DROP TABLE IF EXISTS ").append(newTableName).append(";\n");
+                sb.append("\tDROP TABLE IF EXISTS ").append(newTableName).append(";\n");
             }
-            sb.append("DROP TABLE IF EXISTS ").append(primaryDeltaTableName).append(";\n");
-            sb.append("CREATE TEMPORARY TABLE ").append(newTableName).append(" AS\nSELECT NEW.* FROM (VALUES(1)) _;\n");
-            sb.append("CREATE TEMPORARY TABLE ").append(primaryDeltaTableName).append(" AS \n");
+            sb.append("\tDROP TABLE IF EXISTS ").append(primaryDeltaTableName).append(";\n");
+            sb.append("\tCREATE TEMPORARY TABLE ").append(newTableName).append(" AS\n\tSELECT NEW.* FROM (VALUES(1)) _;\n");
+            sb.append("\tCREATE TEMPORARY TABLE ").append(primaryDeltaTableName).append(" AS \n");
 
             SqlImplementor.Result insertResult = relToSqlConverter.visitChild(0, insertPrimaryDelta);
             sqlWriter.reset();
             sb.append(sqlWriter.format(insertResult.asSelect()));
-            sb.append(";\n");
+            sb.append(";\n\n");
 
-            sb.append("INSERT INTO ").append(materializationTableName).append("(");
+            // Primary delta
+            sb.append("\tINSERT INTO ").append(materializationTableName).append("(");
             for (String fieldName : materializationTableFieldNames) {
                 sb.append(fieldName).append(',');
             }
             sb.setCharAt(sb.length() - 1, ')');
-            sb.append("\nSELECT ");
+            sb.append("\n\tSELECT ");
             sb.append("*");
-            sb.append(" FROM ").append(primaryDeltaTableName).append(" a;\n");
+            sb.append(" FROM ").append(primaryDeltaTableName).append(" a;\n\n");
 
-            // TODO: the DISTINCT FROM predicate doesn't work with ALL quantor, so we need to correlate
-            // Create the whole delete query through relational expressions
-//            sb.append("DELETE FROM ").append(materializationTableName).append(" a WHERE (");
-//            for (String fieldName : materializationTableFieldNames) {
-//                sb.append(fieldName).append(',');
-//            }
-//            sb.setCharAt(sb.length() - 1, ')');
-//            sb.append(" IS NOT DISTINCT FROM (\n");
-
+            // Secondary delta
             sqlWriter.reset();
             sb.append(sqlWriter.format(relToSqlConverter.visitChild(0, insertSecondaryDelta).asStatement()));
-            sb.append(";\n");
-
-//            sb.append(");\n");
+            sb.append(";\n\n");
 
             sb.append("END IF;\n");
         }
@@ -456,6 +461,7 @@ public class TriggerBasedIvmStrategy {
 
         return true;
     }
+
     /**
      * Classifies each of the predicates in the list into one of these two
      * categories:
@@ -719,7 +725,6 @@ public class TriggerBasedIvmStrategy {
             RelBuilder relBuilder = RelBuilder.create(config);
             List<RexNode> nodeFields = new ArrayList<>(sourceTablePrimaryKeyColumnNames.size());
             List<RexNode> transitionFields = new ArrayList<>(sourceTablePrimaryKeyColumnNames.size());
-//            List<RexNode> conjuncts = new ArrayList<>(sourceTablePrimaryKeyColumnNames.size());
             relBuilder.push(node);
             for (String columnName : sourceTablePrimaryKeyColumnNames) {
                 nodeFields.add(relBuilder.field(1, 0, columnName));
@@ -728,11 +733,6 @@ public class TriggerBasedIvmStrategy {
             for (String columnName : sourceTablePrimaryKeyColumnNames) {
                 transitionFields.add(relBuilder.field(2, 1, columnName));
             }
-
-//            for (int i = 0; i < sourceTablePrimaryKeyColumnNames.size(); i++) {
-//                conjuncts.add(relBuilder.call(equal ? SqlStdOperatorTable.EQUALS : SqlStdOperatorTable.NOT_EQUALS, nodeFields.get(i), transitionFields.get(i)));
-//            }
-//            relBuilder.join(JoinRelType.INNER, RexUtil.composeConjunction(rexBuilder, conjuncts));
 
             relBuilder.join(JoinRelType.INNER, relBuilder.call(equal ? SqlStdOperatorTable.IS_NOT_DISTINCT_FROM : SqlStdOperatorTable.IS_DISTINCT_FROM, relBuilder.call(SqlStdOperatorTable.ROW, nodeFields), relBuilder.call(SqlStdOperatorTable.ROW, transitionFields)));
 
@@ -756,6 +756,99 @@ public class TriggerBasedIvmStrategy {
         protected RelNode correlateJoinWithTransitionTable(RelNode node) {
             return node;
         }
+    }
+
+    private static class DeleteSecondaryDeltaVisitor extends PrimaryDeltaVisitor {
+
+        private final String primaryDeltaTableName;
+        private boolean root = true;
+
+        public DeleteSecondaryDeltaVisitor(FrameworkConfig config, RexBuilder rexBuilder, RelOptTable table, List<String> primaryKeyColumnNames, Table materializationTable, String transitionTableName, String primaryDeltaTableName) {
+            super(config, rexBuilder, table, primaryKeyColumnNames, materializationTable, transitionTableName);
+            this.primaryDeltaTableName = primaryDeltaTableName;
+        }
+
+        @Override
+        protected RelNode correlateJoinWithTransitionTable(RelNode node) {
+            return node;
+        }
+
+        @Override
+        public RelNode visit(LogicalProject project) {
+            boolean original = root;
+            root = false;
+            RelNode node = super.visit(project);
+            if (original) {
+                LogicalProject logicalProject = (LogicalProject) node;
+                LogicalFilter filter;
+                if (logicalProject.getInput() instanceof LogicalFilter) {
+                    filter = (LogicalFilter) logicalProject.getInput();
+                } else {
+                    filter = LogicalFilter.create(logicalProject.getInput(), RexUtil.composeConjunction(rexBuilder, Collections.emptyList()));
+                }
+
+                RelBuilder relBuilder = RelBuilder.create(config);
+                RelDataType materializationRowType = materializationTable.getRowType(rexBuilder.getTypeFactory());
+                List<RelDataTypeField> materializationFieldList = materializationRowType.getFieldList();
+                List<RexNode> nodeFields = new ArrayList<>(materializationFieldList.size());
+                List<RexNode> deltaFields = new ArrayList<>(materializationFieldList.size());
+                relBuilder.push(filter.getInput());
+                nodeFields.addAll(logicalProject.getProjects());
+                relBuilder.transientScan(primaryDeltaTableName, materializationRowType);
+                for (RelDataTypeField field : materializationFieldList) {
+                    deltaFields.add(relBuilder.field(2, 1, field.getName()));
+                }
+
+                relBuilder.join(JoinRelType.INNER, relBuilder.call(SqlStdOperatorTable.IS_NOT_DISTINCT_FROM, relBuilder.call(SqlStdOperatorTable.ROW, nodeFields), relBuilder.call(SqlStdOperatorTable.ROW, deltaFields)));
+                int filterFieldSize = filter.getRowType().getFieldList().size();
+                List<RexNode> filterFields = new ArrayList<>(filterFieldSize);
+                for (int i = 0; i < filterFieldSize; i++) {
+                    filterFields.add(relBuilder.field(i));
+                }
+                relBuilder.project(filterFields);
+
+                List<RexNode> preFields = new ArrayList<>(sourceTablePrimaryKeyColumnNames.size());
+                List<RexNode> mainQueryFields = new ArrayList<>(sourceTablePrimaryKeyColumnNames.size());
+                RelMetadataQuery metadataQuery = relBuilder.getCluster().getMetadataQuery();
+                RelNode currentRelNode = relBuilder.peek();
+                int size = currentRelNode.getRowType().getFieldCount();
+                List<Set<RexNode>> expressionLineages = new ArrayList<>(size);
+                for (int i = 0; i < size; i++) {
+                    expressionLineages.add(metadataQuery.getExpressionLineage(currentRelNode, relBuilder.field(i)));
+                }
+                for (String columnName : sourceTablePrimaryKeyColumnNames) {
+                    int sourceColumnIndex = -1;
+                    OUTER: for (int i = 0; i < expressionLineages.size(); i++) {
+                        Set<RexNode> expressionLineage = expressionLineages.get(i);
+                        if (expressionLineage != null) {
+                            for (RexNode rexNode : expressionLineage) {
+                                if (rexNode instanceof RexTableInputRef) {
+                                    RexTableInputRef ref = (RexTableInputRef) rexNode;
+                                    if (ref.getTableRef().getTable().equals(sourceTable) && columnName.equals(sourceTable.getRowType().getFieldNames().get(ref.getIndex()))) {
+                                        sourceColumnIndex = i;
+                                        break OUTER;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    mainQueryFields.add(relBuilder.field(sourceColumnIndex));
+                }
+                relBuilder.scan(sourceTable.getQualifiedName());
+                for (String columnName : sourceTablePrimaryKeyColumnNames) {
+                    preFields.add(relBuilder.field(2, 1, columnName));
+                }
+                RexNode antiJoinCondition = relBuilder.call(SqlStdOperatorTable.IS_DISTINCT_FROM, relBuilder.call(SqlStdOperatorTable.ROW, preFields), relBuilder.call(SqlStdOperatorTable.ROW, mainQueryFields));
+                relBuilder.antiJoin(antiJoinCondition);
+
+                relBuilder.project(logicalProject.getProjects());
+
+                node = relBuilder.build();
+            }
+            return node;
+        }
+
     }
 
     private static class InsertSecondaryDeltaVisitor extends RelShuttleImpl {

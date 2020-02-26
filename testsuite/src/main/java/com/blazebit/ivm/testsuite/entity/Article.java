@@ -11,6 +11,13 @@ import javax.persistence.Entity;
 public class Article extends LongSequenceEntity {
     private String name;
 
+    public Article() {
+    }
+
+    public Article(String name) {
+        this.name = name;
+    }
+
     public String getName() {
         return name;
     }
