@@ -21,7 +21,6 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelRoot;
 import org.apache.calcite.rel.RelShuttleImpl;
 import org.apache.calcite.rel.core.JoinRelType;
-import org.apache.calcite.rel.core.TableModify;
 import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.logical.LogicalFilter;
 import org.apache.calcite.rel.logical.LogicalJoin;
@@ -30,7 +29,6 @@ import org.apache.calcite.rel.logical.LogicalTableModify;
 import org.apache.calcite.rel.metadata.RelColumnOrigin;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.rel2sql.RelToSqlConverter;
-import org.apache.calcite.rel.rel2sql.SqlImplementor;
 import org.apache.calcite.rel.rules.JoinCommuteRule;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
@@ -208,6 +206,7 @@ public class TriggerBasedIvmStrategy {
         String secondaryDeltaTableName = "_delta2_" + tableName;
         RelDataType materializationTableRowType = materializationTable.getRowType(rexBuilder.getTypeFactory());
         List<String> materializationTableFieldNames = materializationTableRowType.getFieldNames();
+        boolean joinInDelete = true;
 
         // DELETE
         {
@@ -234,11 +233,55 @@ public class TriggerBasedIvmStrategy {
             sb.append(sqlWriter.format(relToSqlConverter.visitChild(0, deleteSecondaryDelta).asSelect()));
             sb.append(";\n\n");
 
+            // Create null permutations for secondary delta
+            if (tableReferences.size() > 1) {
+                List<List<String>> permutations = permuteNullVariants(materializationTableFieldNames, materializationTableRowType.getFieldList(), getExpressionOrigins(relRoot.rel), tableReferences, sourceTable, true);
+                if (!permutations.isEmpty()) {
+                    sb.append("INSERT INTO ").append(secondaryDeltaTableName).append("(");
+                    for (String fieldName : materializationTableFieldNames) {
+                        sb.append(fieldName).append(',');
+                    }
+                    sb.setCharAt(sb.length() - 1, ')');
+                    sb.append("\n\tSELECT * FROM (\n\t\t");
+                    for (int i = 0; i < permutations.size(); i++) {
+                        List<String> permutation = permutations.get(i);
+                        if (i != 0) {
+                            sb.append("\t\tUNION ALL\n\t\t");
+                        }
+                        sb.append("SELECT ");
+                        for (String columnExpression : permutation) {
+                            sb.append(columnExpression).append(", ");
+                        }
+
+                        sb.setLength(sb.length() - 2);
+                        sb.append(" FROM ").append(primaryDeltaTableName).append(" a\n");
+                        sb.append("\t\tWHERE ");
+                        // Filter out the all null case
+                        for (int j = 0; j < permutation.size(); j++) {
+                            String columnExpression = permutation.get(j);
+                            if (columnExpression.equals(materializationTableFieldNames.get(j))) {
+                                sb.append(columnExpression).append(" IS NOT NULL OR ");
+                            }
+                        }
+                        sb.setLength(sb.length() - " OR ".length());
+                        sb.append("\n");
+                    }
+                    sb.append(") b;\n\n");
+                }
+            }
+
             // Primary delta
             sb.append("\tDELETE FROM ")
                 .append(materializationTableName)
-                .append(" a WHERE EXISTS(SELECT 1 FROM ").append(primaryDeltaTableName).append(" d WHERE (");
+                .append(" a");
 
+            if (joinInDelete) {
+                sb.append(" USING ").append(primaryDeltaTableName).append(" d ");
+            } else {
+                sb.append(" WHERE EXISTS(SELECT 1 FROM ").append(primaryDeltaTableName).append(" d ");
+            }
+
+            sb.append("WHERE (");
             for (String fieldName : materializationTableFieldNames) {
                 sb.append("a.").append(fieldName).append(',');
             }
@@ -248,7 +291,11 @@ public class TriggerBasedIvmStrategy {
                 sb.append("d.").append(fieldName).append(',');
             }
             sb.setCharAt(sb.length() - 1, ')');
-            sb.append(");\n\n");
+
+            if (!joinInDelete) {
+                sb.append(")");
+            }
+            sb.append(";\n\n");
 
             // Secondary delta
             sb.append("INSERT INTO ").append(materializationTableName).append("(");
@@ -291,7 +338,7 @@ public class TriggerBasedIvmStrategy {
 
             // Create null permutations for secondary delta
             if (tableReferences.size() > 1) {
-                List<List<String>> permutations = permuteNullVariants(materializationTableFieldNames, materializationTableRowType.getFieldList(), getExpressionOrigins(relRoot.rel), tableReferences, sourceTable);
+                List<List<String>> permutations = permuteNullVariants(materializationTableFieldNames, materializationTableRowType.getFieldList(), getExpressionOrigins(relRoot.rel), tableReferences, sourceTable, false);
                 if (!permutations.isEmpty()) {
                     sb.append("INSERT INTO ").append(secondaryDeltaTableName).append("(");
                     for (String fieldName : materializationTableFieldNames) {
@@ -328,7 +375,6 @@ public class TriggerBasedIvmStrategy {
             // Secondary delta
             sqlWriter.reset();
             String delete = sqlWriter.format(relToSqlConverter.visitChild(0, createDeleteWhereExists(config, rexBuilder, materializationTable, secondaryDeltaTableName)).asStatement());
-            boolean joinInDelete = true;
             if (joinInDelete) {
                 int existsIndex = delete.indexOf("WHERE EXISTS (");
                 sb.append(delete, 0, existsIndex);
@@ -355,7 +401,7 @@ public class TriggerBasedIvmStrategy {
         return expressionLineages;
     }
 
-    private List<List<String>> permuteNullVariants(List<String> projectionColumns, List<RelDataTypeField> fieldList, List<Set<RelColumnOrigin>> columnOrigins, Set<RexTableInputRef.RelTableRef> tableReferences, RelOptTable sourceTable) {
+    private List<List<String>> permuteNullVariants(List<String> projectionColumns, List<RelDataTypeField> fieldList, List<Set<RelColumnOrigin>> columnOrigins, Set<RexTableInputRef.RelTableRef> tableReferences, RelOptTable sourceTable, boolean withSourceTableOnly) {
         List<List<String>> list = new ArrayList<>(tableReferences.size());
         List<Set<RelOptTable>> nullingTablePermutations = new ArrayList<>(tableReferences.size() - 1);
 
@@ -365,14 +411,20 @@ public class TriggerBasedIvmStrategy {
         }
         tablesExceptSource.remove(sourceTable);
         RelOptTable[] tablesExceptSourceArray = tablesExceptSource.toArray(new RelOptTable[0]);
-        // Start at 1 to avoid the all-null case
-        for (int i = 1; i < tablesExceptSourceArray.length; i++) {
+        if (tablesExceptSourceArray.length == 1 && withSourceTableOnly) {
             Set<RelOptTable> permutation = new HashSet<>();
             permutation.add(sourceTable);
-            for (int j = i; j < tablesExceptSourceArray.length; j++) {
-                permutation.add(tablesExceptSourceArray[j]);
-            }
             nullingTablePermutations.add(permutation);
+        } else {
+            // Start at 1 to avoid the all-null case
+            for (int i = 1; i < tablesExceptSourceArray.length; i++) {
+                Set<RelOptTable> permutation = new HashSet<>();
+                permutation.add(sourceTable);
+                for (int j = i; j < tablesExceptSourceArray.length; j++) {
+                    permutation.add(tablesExceptSourceArray[j]);
+                }
+                nullingTablePermutations.add(permutation);
+            }
         }
 
         SqlPrettyWriter sqlWriter = new SqlPrettyWriter(SqlPrettyWriter.config().withDialect(dialect));
@@ -1009,7 +1061,13 @@ public class TriggerBasedIvmStrategy {
                 RexNode antiJoinCondition = relBuilder.call(SqlStdOperatorTable.IS_DISTINCT_FROM, relBuilder.call(SqlStdOperatorTable.ROW, preFields), relBuilder.call(SqlStdOperatorTable.ROW, mainQueryFields));
                 relBuilder.antiJoin(antiJoinCondition);
 
-                relBuilder.project(logicalProject.getProjects());
+                List<RexNode> newProjects = new ArrayList<>(logicalProject.getProjects().size());
+                List<RexNode> projects = logicalProject.getProjects();
+                for (int i = 0; i < projects.size(); i++) {
+                    newProjects.add(relBuilder.alias(projects.get(i), logicalProject.getRowType().getFieldNames().get(i)));
+                }
+
+                relBuilder.project(newProjects);
 
                 node = relBuilder.build();
             }
