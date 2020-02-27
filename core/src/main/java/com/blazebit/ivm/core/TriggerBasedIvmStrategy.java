@@ -27,6 +27,7 @@ import org.apache.calcite.rel.logical.LogicalFilter;
 import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rel.logical.LogicalProject;
 import org.apache.calcite.rel.logical.LogicalTableModify;
+import org.apache.calcite.rel.metadata.RelColumnOrigin;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.rel2sql.RelToSqlConverter;
 import org.apache.calcite.rel.rel2sql.SqlImplementor;
@@ -51,6 +52,7 @@ import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParser;
+import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.pretty.SqlPrettyWriter;
 import org.apache.calcite.sql.validate.SqlConformanceEnum;
 import org.apache.calcite.tools.FrameworkConfig;
@@ -132,7 +134,8 @@ public class TriggerBasedIvmStrategy {
         Map<String, TriggerDefinition> triggers = new HashMap<>();
         final RelMetadataQuery metadataQuery = relRoot.rel.getCluster().getMetadataQuery();
         boolean rowTrigger = true;
-        for (RexTableInputRef.RelTableRef tableReference : metadataQuery.getTableReferences(relRoot.rel)) {
+        Set<RexTableInputRef.RelTableRef> tableReferences = metadataQuery.getTableReferences(relRoot.rel);
+        for (RexTableInputRef.RelTableRef tableReference : tableReferences) {
             StringBuilder triggerSb = new StringBuilder();
             String tableName = tableReference.getQualifiedName().get(1);
             String triggerName = tableName + "_trig";
@@ -140,7 +143,7 @@ public class TriggerBasedIvmStrategy {
             List<String> primaryKeyColumnNames = getPrimaryKeyColumns(connection, tableName);
             String dropScript = "DROP TRIGGER IF EXISTS " + triggerName + " ON " + tableName + "; DROP FUNCTION IF EXISTS " + triggerFunctionName + "();";
             triggerSb.append("CREATE FUNCTION ").append(triggerFunctionName).append("() RETURNS trigger AS \n$$\nBEGIN\n");
-            generateTrigger(triggerSb, normalize, tableReference.getTable(), rowTrigger, primaryKeyColumnNames);
+            generateTrigger(triggerSb, normalize, tableReference.getTable(), rowTrigger, primaryKeyColumnNames, tableReferences);
             triggerSb.append("\nRETURN NEW;");
             triggerSb.append("\nEND;\n$$ LANGUAGE 'plpgsql';\n");
             triggerSb.append("CREATE TRIGGER ").append(triggerName).append(" AFTER INSERT OR UPDATE OR DELETE ON ").append(tableName);
@@ -195,14 +198,16 @@ public class TriggerBasedIvmStrategy {
         return joinType;
     }
 
-    private void generateTrigger(StringBuilder sb, Set<Term> normalizedTerms, RelOptTable sourceTable, boolean rowTrigger, List<String> primaryKeyColumnNames) {
+    private void generateTrigger(StringBuilder sb, Set<Term> normalizedTerms, RelOptTable sourceTable, boolean rowTrigger, List<String> primaryKeyColumnNames, Set<RexTableInputRef.RelTableRef> tableReferences) {
         RelToSqlConverter relToSqlConverter = new RelToSqlConverter(dialect);
         SqlPrettyWriter sqlWriter = new SqlPrettyWriter(SqlPrettyWriter.config().withDialect(dialect));
         String tableName = sourceTable.getQualifiedName().get(sourceTable.getQualifiedName().size() - 1);
         String oldTableName = "_old_" + tableName;
         String newTableName = "_new_" + tableName;
         String primaryDeltaTableName = "_delta1_" + tableName;
-        List<String> materializationTableFieldNames = materializationTable.getRowType(rexBuilder.getTypeFactory()).getFieldNames();
+        String secondaryDeltaTableName = "_delta2_" + tableName;
+        RelDataType materializationTableRowType = materializationTable.getRowType(rexBuilder.getTypeFactory());
+        List<String> materializationTableFieldNames = materializationTableRowType.getFieldNames();
 
         // DELETE
         {
@@ -215,12 +220,18 @@ public class TriggerBasedIvmStrategy {
                 sb.append("\tDROP TABLE IF EXISTS ").append(oldTableName).append(";\n");
             }
             sb.append("\tDROP TABLE IF EXISTS ").append(primaryDeltaTableName).append(";\n");
+            sb.append("\tDROP TABLE IF EXISTS ").append(secondaryDeltaTableName).append(";\n");
             sb.append("\tCREATE TEMPORARY TABLE ").append(oldTableName).append(" AS\n\tSELECT OLD.* FROM (VALUES(1)) _;\n");
             sb.append("\tCREATE TEMPORARY TABLE ").append(primaryDeltaTableName).append(" AS \n");
 
-            SqlImplementor.Result deleteResult = relToSqlConverter.visitChild(0, deletePrimaryDelta);
             sqlWriter.reset();
-            sb.append(sqlWriter.format(deleteResult.asSelect()));
+            sb.append(sqlWriter.format(relToSqlConverter.visitChild(0, deletePrimaryDelta).asSelect()));
+            sb.append(";\n\n");
+
+            sb.append("\tCREATE TEMPORARY TABLE ").append(secondaryDeltaTableName).append(" AS \n");
+
+            sqlWriter.reset();
+            sb.append(sqlWriter.format(relToSqlConverter.visitChild(0, deleteSecondaryDelta).asSelect()));
             sb.append(";\n\n");
 
             // Primary delta
@@ -245,10 +256,9 @@ public class TriggerBasedIvmStrategy {
                 sb.append(fieldName).append(',');
             }
             sb.setCharAt(sb.length() - 1, ')');
-            sb.append("\n");
-            sqlWriter.reset();
-            sb.append(sqlWriter.format(relToSqlConverter.visitChild(0, deleteSecondaryDelta).asStatement()));
-            sb.append(";\n\n");
+            sb.append("\n\tSELECT ");
+            sb.append("*");
+            sb.append(" FROM ").append(secondaryDeltaTableName).append(" a;\n\n");
 
             sb.append("END IF;\n\n");
         }
@@ -265,13 +275,45 @@ public class TriggerBasedIvmStrategy {
                 sb.append("\tDROP TABLE IF EXISTS ").append(newTableName).append(";\n");
             }
             sb.append("\tDROP TABLE IF EXISTS ").append(primaryDeltaTableName).append(";\n");
+            sb.append("\tDROP TABLE IF EXISTS ").append(secondaryDeltaTableName).append(";\n");
             sb.append("\tCREATE TEMPORARY TABLE ").append(newTableName).append(" AS\n\tSELECT NEW.* FROM (VALUES(1)) _;\n");
             sb.append("\tCREATE TEMPORARY TABLE ").append(primaryDeltaTableName).append(" AS \n");
 
-            SqlImplementor.Result insertResult = relToSqlConverter.visitChild(0, insertPrimaryDelta);
             sqlWriter.reset();
-            sb.append(sqlWriter.format(insertResult.asSelect()));
+            sb.append(sqlWriter.format(relToSqlConverter.visitChild(0, insertPrimaryDelta).asSelect()));
             sb.append(";\n\n");
+
+            sb.append("\tCREATE TEMPORARY TABLE ").append(secondaryDeltaTableName).append(" AS \n");
+
+            sqlWriter.reset();
+            sb.append(sqlWriter.format(relToSqlConverter.visitChild(0, insertSecondaryDelta).asSelect()));
+            sb.append(";\n\n");
+
+            // Create null permutations for secondary delta
+            if (tableReferences.size() > 1) {
+                List<List<String>> permutations = permuteNullVariants(materializationTableFieldNames, materializationTableRowType.getFieldList(), getExpressionOrigins(relRoot.rel), tableReferences, sourceTable);
+                if (!permutations.isEmpty()) {
+                    sb.append("INSERT INTO ").append(secondaryDeltaTableName).append("(");
+                    for (String fieldName : materializationTableFieldNames) {
+                        sb.append(fieldName).append(',');
+                    }
+                    sb.setCharAt(sb.length() - 1, ')');
+                    sb.append("\n\tSELECT * FROM (\n\t\t");
+                    for (int i = 0; i < permutations.size(); i++) {
+                        if (i != 0) {
+                            sb.append("\t\tUNION ALL\n\t\t");
+                        }
+                        sb.append("SELECT ");
+                        for (String columnExpression : permutations.get(i)) {
+                            sb.append(columnExpression).append(", ");
+                        }
+
+                        sb.setLength(sb.length() - 2);
+                        sb.append(" FROM ").append(primaryDeltaTableName).append(" a\n");
+                    }
+                    sb.append(") b;\n\n");
+                }
+            }
 
             // Primary delta
             sb.append("\tINSERT INTO ").append(materializationTableName).append("(");
@@ -285,10 +327,135 @@ public class TriggerBasedIvmStrategy {
 
             // Secondary delta
             sqlWriter.reset();
-            sb.append(sqlWriter.format(relToSqlConverter.visitChild(0, insertSecondaryDelta).asStatement()));
+            String delete = sqlWriter.format(relToSqlConverter.visitChild(0, createDeleteWhereExists(config, rexBuilder, materializationTable, secondaryDeltaTableName)).asStatement());
+            boolean joinInDelete = true;
+            if (joinInDelete) {
+                int existsIndex = delete.indexOf("WHERE EXISTS (");
+                sb.append(delete, 0, existsIndex);
+                sb.append("USING ");
+                sb.append(delete, delete.indexOf(" FROM ", existsIndex) + " FROM ".length(), delete.length() - 1);
+            } else {
+                sb.append(delete);
+            }
             sb.append(";\n\n");
 
             sb.append("END IF;\n");
+        }
+    }
+
+    private List<Set<RelColumnOrigin>> getExpressionOrigins(RelNode relNode) {
+        RelBuilder relBuilder = RelBuilder.create(config);
+        relBuilder.push(relNode);
+        RelMetadataQuery metadataQuery = relBuilder.getCluster().getMetadataQuery();
+        int size = relNode.getRowType().getFieldCount();
+        List<Set<RelColumnOrigin>> expressionLineages = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            expressionLineages.add(metadataQuery.getColumnOrigins(relNode, i));
+        }
+        return expressionLineages;
+    }
+
+    private List<List<String>> permuteNullVariants(List<String> projectionColumns, List<RelDataTypeField> fieldList, List<Set<RelColumnOrigin>> columnOrigins, Set<RexTableInputRef.RelTableRef> tableReferences, RelOptTable sourceTable) {
+        List<List<String>> list = new ArrayList<>(tableReferences.size());
+        List<Set<RelOptTable>> nullingTablePermutations = new ArrayList<>(tableReferences.size() - 1);
+
+        Set<RelOptTable> tablesExceptSource = new HashSet<>(tableReferences.size() - 1);
+        for (RexTableInputRef.RelTableRef tableReference : tableReferences) {
+            tablesExceptSource.add(tableReference.getTable());
+        }
+        tablesExceptSource.remove(sourceTable);
+        RelOptTable[] tablesExceptSourceArray = tablesExceptSource.toArray(new RelOptTable[0]);
+        // Start at 1 to avoid the all-null case
+        for (int i = 1; i < tablesExceptSourceArray.length; i++) {
+            Set<RelOptTable> permutation = new HashSet<>();
+            permutation.add(sourceTable);
+            for (int j = i; j < tablesExceptSourceArray.length; j++) {
+                permutation.add(tablesExceptSourceArray[j]);
+            }
+            nullingTablePermutations.add(permutation);
+        }
+
+        SqlPrettyWriter sqlWriter = new SqlPrettyWriter(SqlPrettyWriter.config().withDialect(dialect));
+        for (Set<RelOptTable> nullingTables : nullingTablePermutations) {
+            List<String> permutation = new ArrayList<>(projectionColumns);
+            boolean valid = false;
+            for (int i = 0; i < columnOrigins.size(); i++) {
+                Set<RelColumnOrigin> expressionLineage = columnOrigins.get(i);
+                if (expressionLineage != null) {
+                    for (RelColumnOrigin origin : expressionLineage) {
+                        if (nullingTables.contains(origin.getOriginTable())) {
+                            sqlWriter.reset();
+                            permutation.set(i, sqlWriter.format(SqlStdOperatorTable.CAST.createCall(
+                                SqlParserPos.ZERO,
+                                SqlLiteral.createNull(SqlParserPos.ZERO),
+                                dialect.getCastSpec(fieldList.get(i).getType())
+                            )));
+                            valid = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (valid) {
+                list.add(permutation);
+            }
+        }
+        return list;
+    }
+
+    private RelNode createDeleteWhereExists(FrameworkConfig config, RexBuilder rexBuilder, Table materializationTable, String secondaryDeltaTableName) {
+        RelBuilder relBuilder = RelBuilder.create(config);
+        CalciteCatalogReader catalogReader = createCatalogReader(config, rexBuilder);
+        ImmutableList<String> qualifiedMaterializationTableName = ((JdbcTable) materializationTable).tableName().names;
+        RelOptTable materializationRelOptTable = catalogReader.getTableForMember(qualifiedMaterializationTableName.subList(1, qualifiedMaterializationTableName.size()));
+
+        relBuilder.transientScan(qualifiedMaterializationTableName.get(qualifiedMaterializationTableName.size() - 1), materializationRelOptTable.getRowType());
+        List<RexNode> materializationFields = relBuilder.fields();
+
+        relBuilder.transientScan(secondaryDeltaTableName, materializationTable.getRowType(relBuilder.getTypeFactory()));
+
+        List<RexNode> subqueryFields = relBuilder.fields(2, 1);
+
+        relBuilder.join(JoinRelType.SEMI, relBuilder.call(SqlStdOperatorTable.IS_NOT_DISTINCT_FROM, relBuilder.call(SqlStdOperatorTable.ROW, subqueryFields), relBuilder.call(SqlStdOperatorTable.ROW, materializationFields)));
+
+        LogicalTableModify logicalTableModify = LogicalTableModify.create(materializationRelOptTable, catalogReader, relBuilder.build(),
+                                                                          LogicalTableModify.Operation.DELETE, null, null, false);
+        return logicalTableModify;
+    }
+
+    private static CalciteCatalogReader createCatalogReader(FrameworkConfig config, RexBuilder rexBuilder) {
+        final SchemaPlus rootSchema = rootSchema(config.getDefaultSchema());
+
+        return new CalciteCatalogReader(
+            CalciteSchema.from(rootSchema),
+            CalciteSchema.from(config.getDefaultSchema()).path(null),
+            rexBuilder.getTypeFactory(), connConfig(config));
+    }
+
+    private static CalciteConnectionConfig connConfig(FrameworkConfig c) {
+        CalciteConnectionConfigImpl config =
+            c.getContext().unwrap(CalciteConnectionConfigImpl.class);
+        if (config == null) {
+            config = new CalciteConnectionConfigImpl(new Properties());
+        }
+        if (!config.isSet(CalciteConnectionProperty.CASE_SENSITIVE)) {
+            config = config.set(CalciteConnectionProperty.CASE_SENSITIVE,
+                                String.valueOf(c.getParserConfig().caseSensitive()));
+        }
+        if (!config.isSet(CalciteConnectionProperty.CONFORMANCE)) {
+            config = config.set(CalciteConnectionProperty.CONFORMANCE,
+                                String.valueOf(c.getParserConfig().conformance()));
+        }
+        return config;
+    }
+
+    private static SchemaPlus rootSchema(SchemaPlus schema) {
+        for (;;) {
+            if (schema.getParentSchema() == null) {
+                return schema;
+            }
+            schema = schema.getParentSchema();
         }
     }
 
@@ -950,72 +1117,17 @@ public class TriggerBasedIvmStrategy {
                     antiJoinCondition = relBuilder.and(((LogicalFilter) antiJoinBaseNode).getCondition(), antiJoinCondition);
                 }
                 relBuilder.antiJoin(antiJoinCondition);
+                List<RexNode> newProjects = new ArrayList<>(logicalProject.getProjects().size());
+                List<RexNode> projects = logicalProject.getProjects();
+                for (int i = 0; i < projects.size(); i++) {
+                    newProjects.add(relBuilder.alias(projects.get(i), logicalProject.getRowType().getFieldNames().get(i)));
+                }
+
+                relBuilder.project(newProjects);
 
                 node = relBuilder.build();
-
-                CalciteCatalogReader catalogReader = createCatalogReader();
-                ImmutableList<String> qualifiedMaterializationTableName = ((JdbcTable) materializationTable).tableName().names;
-                RelOptTable materializationRelOptTable = catalogReader.getTableForMember(qualifiedMaterializationTableName.subList(1, qualifiedMaterializationTableName.size()));
-                relBuilder.clear();
-
-                relBuilder.transientScan(qualifiedMaterializationTableName.get(qualifiedMaterializationTableName.size() - 1), materializationRelOptTable.getRowType());
-                List<RexNode> materializationFields = relBuilder.fields();
-
-                relBuilder.push(node);
-
-                List<RexNode> subqueryFields = new ArrayList<>(logicalProject.getProjects().size());
-                for (RexNode projectNode : logicalProject.getProjects()) {
-                    subqueryFields.add(projectNode.accept(new RexShuttle(){
-                        @Override
-                        public RexNode visitInputRef(RexInputRef inputRef) {
-                            return new RexInputRef(materializationFields.size() + inputRef.getIndex(), inputRef.getType());
-                        }
-                    }));
-                }
-
-                relBuilder.join(JoinRelType.SEMI, relBuilder.call(SqlStdOperatorTable.IS_NOT_DISTINCT_FROM, relBuilder.call(SqlStdOperatorTable.ROW, subqueryFields), relBuilder.call(SqlStdOperatorTable.ROW, materializationFields)));
-
-                LogicalTableModify logicalTableModify = LogicalTableModify.create(materializationRelOptTable, catalogReader, relBuilder.build(),
-                                                                                  LogicalTableModify.Operation.DELETE, null, null, false);
-
-                node = logicalTableModify;
             }
             return node;
-        }
-
-        private CalciteCatalogReader createCatalogReader() {
-            final SchemaPlus rootSchema = rootSchema(config.getDefaultSchema());
-
-            return new CalciteCatalogReader(
-                CalciteSchema.from(rootSchema),
-                CalciteSchema.from(config.getDefaultSchema()).path(null),
-                rexBuilder.getTypeFactory(), connConfig());
-        }
-
-        private CalciteConnectionConfig connConfig() {
-            CalciteConnectionConfigImpl config =
-                this.config.getContext().unwrap(CalciteConnectionConfigImpl.class);
-            if (config == null) {
-                config = new CalciteConnectionConfigImpl(new Properties());
-            }
-            if (!config.isSet(CalciteConnectionProperty.CASE_SENSITIVE)) {
-                config = config.set(CalciteConnectionProperty.CASE_SENSITIVE,
-                                    String.valueOf(this.config.getParserConfig().caseSensitive()));
-            }
-            if (!config.isSet(CalciteConnectionProperty.CONFORMANCE)) {
-                config = config.set(CalciteConnectionProperty.CONFORMANCE,
-                                    String.valueOf(this.config.getParserConfig().conformance()));
-            }
-            return config;
-        }
-
-        private static SchemaPlus rootSchema(SchemaPlus schema) {
-            for (;;) {
-                if (schema.getParentSchema() == null) {
-                    return schema;
-                }
-                schema = schema.getParentSchema();
-            }
         }
 
     }

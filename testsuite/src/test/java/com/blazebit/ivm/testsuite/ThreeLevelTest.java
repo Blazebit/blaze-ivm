@@ -14,7 +14,7 @@ import java.util.Map;
  * @author Christian Beikov
  * @since 1.0.0
  */
-public class SimpleTest extends MaterializationTest {
+public class ThreeLevelTest extends MaterializationTest {
 
     private static final String viewQuery = "SELECT art.id as art_id, ord.id as ord_id, art.name, ordpos.amount FROM _order ord " +
         "LEFT JOIN order_position ordpos ON ordpos.order_id = ord.id " +
@@ -42,7 +42,7 @@ public class SimpleTest extends MaterializationTest {
         em.flush();
 
         // create view
-        setupMaterialization(viewQuery);
+        Map<String, TriggerBasedIvmStrategy.TriggerDefinition> triggerDefinitions = setupMaterialization(viewQuery);
 
         // When
         Order newOrder = new Order();
@@ -67,7 +67,7 @@ public class SimpleTest extends MaterializationTest {
         em.flush();
 
         // create view
-        setupMaterialization(viewQuery);
+        Map<String, TriggerBasedIvmStrategy.TriggerDefinition> triggerDefinitions = setupMaterialization(viewQuery);
 
         // When
         em.remove(order2);
@@ -93,11 +93,37 @@ public class SimpleTest extends MaterializationTest {
         em.flush();
 
         // create view
-        setupMaterialization(viewQuery);
+        Map<String, TriggerBasedIvmStrategy.TriggerDefinition> triggerDefinitions = setupMaterialization(viewQuery);
 
         // When
         em.remove(orderPosition2);
         em.remove(order2);
+        em.flush();
+
+        // Then
+        assertMaterializationEqual();
+    }
+
+    @Test
+    public void deleteSubToEmptyTest() {
+        // Given
+        Order order1 = new Order();
+        Order order2 = new Order();
+        Article article = new Article("Article 1");
+        em.persist(order1);
+        em.persist(order2);
+        em.persist(article);
+        OrderPosition orderPosition = new OrderPosition(order1, article);
+        em.persist(orderPosition);
+        OrderPosition orderPosition2 = new OrderPosition(order2, article);
+        em.persist(orderPosition2);
+        em.flush();
+
+        // create view
+        Map<String, TriggerBasedIvmStrategy.TriggerDefinition> triggerDefinitions = setupMaterialization(viewQuery);
+
+        // When
+        em.remove(orderPosition2);
         em.flush();
 
         // Then
@@ -118,7 +144,7 @@ public class SimpleTest extends MaterializationTest {
         em.flush();
 
         // create view
-        setupMaterialization(viewQuery);
+        Map<String, TriggerBasedIvmStrategy.TriggerDefinition> triggerDefinitions = setupMaterialization(viewQuery);
 
         // When
         em.persist(new OrderPosition(order2, article1));
@@ -146,7 +172,7 @@ public class SimpleTest extends MaterializationTest {
         em.flush();
 
         // create view
-        setupMaterialization(viewQuery);
+        Map<String, TriggerBasedIvmStrategy.TriggerDefinition> triggerDefinitions = setupMaterialization(viewQuery);
 
         // When
         em.persist(new OrderPosition(order2, article2));
