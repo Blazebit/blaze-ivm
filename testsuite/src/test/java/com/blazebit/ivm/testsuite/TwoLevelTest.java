@@ -16,7 +16,7 @@ import java.util.Map;
  */
 public class TwoLevelTest extends MaterializationTest {
 
-    private static final String viewQuery = "SELECT ord.id as ord_id, ordpos.amount FROM _order ord " +
+    private static final String viewQuery = "SELECT ord.id as ord_id, ordpos.article_id, ordpos.amount FROM _order ord " +
         "LEFT JOIN order_position ordpos ON ordpos.order_id = ord.id " +
         "WHERE ord.id > 0";
 
@@ -123,6 +123,37 @@ public class TwoLevelTest extends MaterializationTest {
 
         // When
         em.remove(orderPosition2);
+        em.flush();
+
+        // Then
+        assertMaterializationEqual();
+    }
+    @Test
+
+    public void deleteSubTest() {
+        // Given
+        Order order1 = new Order();
+        Order order2 = new Order();
+        Article article1 = new Article("Article 1");
+        Article article2 = new Article("Article 2");
+        em.persist(order1);
+        em.persist(order2);
+        em.persist(article1);
+        em.persist(article2);
+        OrderPosition orderPosition1_1 = new OrderPosition(order1, article1);
+        em.persist(orderPosition1_1);
+        OrderPosition orderPosition2_1 = new OrderPosition(order2, article1);
+        em.persist(orderPosition2_1);
+        OrderPosition orderPosition2_2 = new OrderPosition(order2, article2);
+        em.persist(orderPosition2_2);
+        em.flush();
+
+        // create view
+        Map<String, TriggerBasedIvmStrategy.TriggerDefinition> triggerDefinitions = setupMaterialization(viewQuery);
+
+        // When
+        em.remove(orderPosition1_1);
+        em.remove(orderPosition2_1);
         em.flush();
 
         // Then

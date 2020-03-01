@@ -116,12 +116,12 @@ public abstract class MaterializationTest extends AbstractHibernatePersistenceTe
             }
             StringBuilder sbMissingRows = new StringBuilder();
             appendSelect(sbMissingRows, "native_mat", columns);
-            sbMissingRows.append(" EXCEPT ");
+            sbMissingRows.append(" EXCEPT ALL ");
             appendSelect(sbMissingRows, "trigger_mat", columns);
             
             StringBuilder sbStaleRows = new StringBuilder();
             appendSelect(sbStaleRows, "trigger_mat", columns);
-            sbStaleRows.append(" EXCEPT ");
+            sbStaleRows.append(" EXCEPT ALL ");
             appendSelect(sbStaleRows, "native_mat", columns);
             try (Statement statement = connection.createStatement()) {
                 StringBuilder rows = new StringBuilder();
@@ -131,7 +131,7 @@ public abstract class MaterializationTest extends AbstractHibernatePersistenceTe
                     try (ResultSet rs = statement.executeQuery(selectStatement)) {
                         if (rs.next()) {
                             _assertionFailed = true;
-                            rows.append(title + "\n");
+                            rows.append(title).append('\n');
                             for (String column : columns) {
                                 rows.append(column).append('|');
                             }
