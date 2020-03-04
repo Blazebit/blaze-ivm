@@ -128,8 +128,8 @@ public class TwoLevelTest extends MaterializationTest {
         // Then
         assertMaterializationEqual();
     }
-    @Test
 
+    @Test
     public void deleteSubTest() {
         // Given
         Order order1 = new Order();

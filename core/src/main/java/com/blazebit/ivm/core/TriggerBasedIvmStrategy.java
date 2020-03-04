@@ -211,8 +211,7 @@ public class TriggerBasedIvmStrategy {
         // DELETE
         {
             RelNode deletePrimaryDelta = relRoot.rel.accept(new DeletePrimaryDeltaVisitor(config, rexBuilder, sourceTable, primaryKeyColumnNames, materializationTable, oldTableName));
-            RelNode deleteSecondaryDelta = relRoot.rel.accept(new SecondaryDeltaVisitor(config, rexBuilder, sourceTable, primaryKeyColumnNames, materializationTable, newTableName));
-            deleteSecondaryDelta = deleteSecondaryDelta.accept(new DeleteSecondaryDeltaVisitor(config, rexBuilder, sourceTable, primaryKeyColumnNames, materializationTable, oldTableName, primaryDeltaTableName, tableReferences));
+            RelNode deleteSecondaryDelta = relRoot.rel.accept(new DeleteSecondaryDeltaVisitor(config, rexBuilder, sourceTable, primaryKeyColumnNames, materializationTable, oldTableName, primaryDeltaTableName, tableReferences));
 
             sb.append("IF TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN\n");
             if (rowTrigger) {
@@ -1046,13 +1045,18 @@ public class TriggerBasedIvmStrategy {
 
         @Override
         protected RelNode correlateJoinWithTransitionTable(RelNode node) {
-            return node;
+            RelBuilder relBuilder = RelBuilder.create(config);
+            return relBuilder.transientScan(transitionTableName, node.getRowType()).build();
         }
 
         @Override
         public RelNode visit(LogicalProject project) {
             boolean original = root;
             root = false;
+            List<Set<RelColumnOrigin>> expressionOrigins = null;
+            if (original) {
+                expressionOrigins = getExpressionOrigins(config, project);
+            }
             RelNode node = super.visit(project);
             if (original) {
                 LogicalProject logicalProject = (LogicalProject) node;
@@ -1064,12 +1068,9 @@ public class TriggerBasedIvmStrategy {
                     filter = LogicalFilter.create(logicalProject.getInput(), RexUtil.composeConjunction(rexBuilder, Collections.emptyList()));
                 }
 
-                List<Set<RelColumnOrigin>> expressionOrigins = getExpressionOrigins(config, logicalProject);
-
                 RelBuilder relBuilder = RelBuilder.create(config);
                 RelDataType materializationRowType = materializationTable.getRowType(rexBuilder.getTypeFactory());
                 List<RelDataTypeField> materializationFieldList = materializationRowType.getFieldList();
-                List<RexNode> nodeFields = new ArrayList<>(materializationFieldList.size());
                 List<RexNode> deltaFields = new ArrayList<>(materializationFieldList.size());
 
                 relBuilder.push(filter.getInput());
@@ -1091,33 +1092,23 @@ public class TriggerBasedIvmStrategy {
 
                 int valuesOffset = relBuilder.peek().getRowType().getFieldCount();
                 relBuilder.values(tableReferenceFieldNames, (Object[]) permuteNullVariants(expressionOrigins, tableReferences, sourceTable, true));
-                relBuilder.join(JoinRelType.INNER);
+                relBuilder.join(JoinRelType.FULL);
 
                 List<RexNode> nullVariantProjects = new ArrayList<>(logicalProject.getProjects().size());
                 for (int i = 0; i < projects.size(); i++) {
                     nullVariantProjects.add(
                         rexBuilder.makeCall(
                             SqlStdOperatorTable.CASE,
-                            relBuilder.equals(relBuilder.field(valuesOffset + i), relBuilder.literal(true)),
+                            relBuilder.equals(relBuilder.field(valuesOffset + i), relBuilder.literal(false)),
                             projects.get(i),
                             rexBuilder.makeNullLiteral(projects.get(i).getType())
                         )
                     );
                 }
 
-                relBuilder.project(nullVariantProjects);
-
-                // Join transformed query against primary delta
-                nodeFields.addAll(relBuilder.fields());
-                relBuilder.transientScan(primaryDeltaTableName, materializationRowType);
-                for (RelDataTypeField field : materializationFieldList) {
-                    deltaFields.add(relBuilder.field(2, 1, field.getName()));
-                }
-
-                relBuilder.join(JoinRelType.INNER, relBuilder.call(SqlStdOperatorTable.IS_NOT_DISTINCT_FROM, relBuilder.call(SqlStdOperatorTable.ROW, nodeFields), relBuilder.call(SqlStdOperatorTable.ROW, deltaFields)));
-
                 // Anti-Join the query against the source table
                 // We care about results that don't exist in the source table
+                // TODO: Instead of using sourceTablePrimaryKeyColumnNames we must determine all columns that are used in a non-null context(i.e. after the primary transformation)
                 List<RexNode> preFields = new ArrayList<>(sourceTablePrimaryKeyColumnNames.size());
                 List<RexNode> mainQueryFields = new ArrayList<>(sourceTablePrimaryKeyColumnNames.size());
                 for (String columnName : sourceTablePrimaryKeyColumnNames) {
@@ -1128,7 +1119,8 @@ public class TriggerBasedIvmStrategy {
                             for (RexNode rexNode : expressionLineage) {
                                 if (rexNode instanceof RexTableInputRef) {
                                     RexTableInputRef ref = (RexTableInputRef) rexNode;
-                                    if (ref.getTableRef().getTable().equals(sourceTable) && columnName.equals(sourceTable.getRowType().getFieldNames().get(ref.getIndex()))) {
+                                    List<String> qualifiedName = ref.getTableRef().getTable().getQualifiedName();
+                                    if (transitionTableName.equals(qualifiedName.get(qualifiedName.size() - 1)) && columnName.equals(sourceTable.getRowType().getFieldNames().get(ref.getIndex()))) {
                                         sourceColumnIndex = i;
                                         break OUTER;
                                     }
@@ -1143,7 +1135,7 @@ public class TriggerBasedIvmStrategy {
                 for (String columnName : sourceTablePrimaryKeyColumnNames) {
                     preFields.add(relBuilder.field(2, 1, columnName));
                 }
-                RexNode antiJoinCondition = relBuilder.call(SqlStdOperatorTable.IS_DISTINCT_FROM, relBuilder.call(SqlStdOperatorTable.ROW, preFields), relBuilder.call(SqlStdOperatorTable.ROW, mainQueryFields));
+                RexNode antiJoinCondition = relBuilder.call(SqlStdOperatorTable.IS_NOT_DISTINCT_FROM, relBuilder.call(SqlStdOperatorTable.ROW, preFields), relBuilder.call(SqlStdOperatorTable.ROW, mainQueryFields));
                 relBuilder.antiJoin(antiJoinCondition);
 
                 // Project the first fields again
@@ -1153,7 +1145,11 @@ public class TriggerBasedIvmStrategy {
                 }
 
                 node = relBuilder.build();
-                node = adaptProjectType(logicalProject, node, newProjects, logicalProject.getRowType());
+                node = adaptProjectType(logicalProject, node, nullVariantProjects, logicalProject.getRowType());
+                relBuilder.clear();
+                relBuilder.push(node);
+                relBuilder.distinct();
+                node = relBuilder.build();
             }
             return node;
         }
