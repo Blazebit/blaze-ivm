@@ -212,7 +212,7 @@ public class TriggerBasedIvmStrategy {
         {
             RelNode deletePrimaryDelta = relRoot.rel.accept(new DeletePrimaryDeltaVisitor(config, rexBuilder, sourceTable, primaryKeyColumnNames, materializationTable, oldTableName));
             RelNode deleteSecondaryDelta = relRoot.rel.accept(new SecondaryDeltaVisitor(config, rexBuilder, sourceTable, primaryKeyColumnNames, materializationTable, newTableName));
-            deleteSecondaryDelta = deleteSecondaryDelta.accept(new DeleteSecondaryDeltaVisitor(config, rexBuilder, sourceTable, primaryKeyColumnNames, materializationTable, oldTableName, primaryDeltaTableName));
+            deleteSecondaryDelta = deleteSecondaryDelta.accept(new DeleteSecondaryDeltaVisitor(config, rexBuilder, sourceTable, primaryKeyColumnNames, materializationTable, oldTableName, primaryDeltaTableName, tableReferences));
 
             sb.append("IF TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN\n");
             if (rowTrigger) {
@@ -234,41 +234,41 @@ public class TriggerBasedIvmStrategy {
             sb.append(";\n\n");
 
             // Create null permutations for secondary delta
-            if (tableReferences.size() > 1) {
-                List<List<String>> permutations = permuteNullVariants(materializationTableFieldNames, materializationTableRowType.getFieldList(), getExpressionOrigins(relRoot.rel), tableReferences, sourceTable, true);
-                if (!permutations.isEmpty()) {
-                    sb.append("INSERT INTO ").append(secondaryDeltaTableName).append("(");
-                    for (String fieldName : materializationTableFieldNames) {
-                        sb.append(fieldName).append(',');
-                    }
-                    sb.setCharAt(sb.length() - 1, ')');
-                    sb.append("\n\tSELECT * FROM (\n\t\t");
-                    for (int i = 0; i < permutations.size(); i++) {
-                        List<String> permutation = permutations.get(i);
-                        if (i != 0) {
-                            sb.append("\t\tUNION ALL\n\t\t");
-                        }
-                        sb.append("SELECT ");
-                        for (String columnExpression : permutation) {
-                            sb.append(columnExpression).append(", ");
-                        }
-
-                        sb.setLength(sb.length() - 2);
-                        sb.append(" FROM ").append(primaryDeltaTableName).append(" a\n");
-                        sb.append("\t\tWHERE ");
-                        // Filter out the all null case
-                        for (int j = 0; j < permutation.size(); j++) {
-                            String columnExpression = permutation.get(j);
-                            if (columnExpression.equals(materializationTableFieldNames.get(j))) {
-                                sb.append(columnExpression).append(" IS NOT NULL OR ");
-                            }
-                        }
-                        sb.setLength(sb.length() - " OR ".length());
-                        sb.append("\n");
-                    }
-                    sb.append(") b;\n\n");
-                }
-            }
+//            if (tableReferences.size() > 1) {
+//                List<List<String>> permutations = permuteNullVariants(materializationTableFieldNames, materializationTableRowType.getFieldList(), getExpressionOrigins(relRoot.rel), tableReferences, sourceTable, true);
+//                if (!permutations.isEmpty()) {
+//                    sb.append("INSERT INTO ").append(secondaryDeltaTableName).append("(");
+//                    for (String fieldName : materializationTableFieldNames) {
+//                        sb.append(fieldName).append(',');
+//                    }
+//                    sb.setCharAt(sb.length() - 1, ')');
+//                    sb.append("\n\tSELECT * FROM (\n\t\t");
+//                    for (int i = 0; i < permutations.size(); i++) {
+//                        List<String> permutation = permutations.get(i);
+//                        if (i != 0) {
+//                            sb.append("\t\tUNION ALL\n\t\t");
+//                        }
+//                        sb.append("SELECT ");
+//                        for (String columnExpression : permutation) {
+//                            sb.append(columnExpression).append(", ");
+//                        }
+//
+//                        sb.setLength(sb.length() - 2);
+//                        sb.append(" FROM ").append(primaryDeltaTableName).append(" a\n");
+//                        sb.append("\t\tWHERE ");
+//                        // Filter out the all null case
+//                        for (int j = 0; j < permutation.size(); j++) {
+//                            String columnExpression = permutation.get(j);
+//                            if (columnExpression.equals(materializationTableFieldNames.get(j))) {
+//                                sb.append(columnExpression).append(" IS NOT NULL OR ");
+//                            }
+//                        }
+//                        sb.setLength(sb.length() - " OR ".length());
+//                        sb.append("\n");
+//                    }
+//                    sb.append(") b;\n\n");
+//                }
+//            }
 
             // Primary delta
             sb.append("\tDELETE FROM ")
@@ -338,7 +338,7 @@ public class TriggerBasedIvmStrategy {
 
             // Create null permutations for secondary delta
             if (tableReferences.size() > 1) {
-                List<List<String>> permutations = permuteNullVariants(materializationTableFieldNames, materializationTableRowType.getFieldList(), getExpressionOrigins(relRoot.rel), tableReferences, sourceTable, false);
+                List<List<String>> permutations = permuteNullVariants(materializationTableFieldNames, materializationTableRowType.getFieldList(), getExpressionOrigins(config, relRoot.rel), tableReferences, sourceTable, false);
                 if (!permutations.isEmpty()) {
                     sb.append("INSERT INTO ").append(secondaryDeltaTableName).append("(");
                     for (String fieldName : materializationTableFieldNames) {
@@ -389,7 +389,7 @@ public class TriggerBasedIvmStrategy {
         }
     }
 
-    private List<Set<RelColumnOrigin>> getExpressionOrigins(RelNode relNode) {
+    private static List<Set<RelColumnOrigin>> getExpressionOrigins(FrameworkConfig config, RelNode relNode) {
         RelBuilder relBuilder = RelBuilder.create(config);
         relBuilder.push(relNode);
         RelMetadataQuery metadataQuery = relBuilder.getCluster().getMetadataQuery();
@@ -454,6 +454,58 @@ public class TriggerBasedIvmStrategy {
             }
         }
         return list;
+    }
+
+    private static Boolean[] permuteNullVariants(List<Set<RelColumnOrigin>> columnOrigins, Set<RexTableInputRef.RelTableRef> tableReferences, RelOptTable sourceTable, boolean withSourceTableOnly) {
+        List<Boolean> list = new ArrayList<>(tableReferences.size());
+        List<Set<RelOptTable>> nullingTablePermutations = new ArrayList<>(tableReferences.size() - 1);
+
+        Set<RelOptTable> tablesExceptSource = new HashSet<>(tableReferences.size() - 1);
+        for (RexTableInputRef.RelTableRef tableReference : tableReferences) {
+            tablesExceptSource.add(tableReference.getTable());
+        }
+        tablesExceptSource.remove(sourceTable);
+        RelOptTable[] tablesExceptSourceArray = tablesExceptSource.toArray(new RelOptTable[0]);
+        if (tablesExceptSourceArray.length == 1 && withSourceTableOnly) {
+            Set<RelOptTable> permutation = new HashSet<>();
+            permutation.add(sourceTable);
+            nullingTablePermutations.add(permutation);
+        } else {
+            // Start at 1 to avoid the all-null case
+            for (int i = 1; i < tablesExceptSourceArray.length; i++) {
+                Set<RelOptTable> permutation = new HashSet<>();
+                permutation.add(sourceTable);
+                for (int j = i; j < tablesExceptSourceArray.length; j++) {
+                    permutation.add(tablesExceptSourceArray[j]);
+                }
+                nullingTablePermutations.add(permutation);
+            }
+        }
+
+        for (Set<RelOptTable> nullingTables : nullingTablePermutations) {
+            List<Boolean> permutation = new ArrayList<>(columnOrigins.size());
+            for (int i = 0; i < columnOrigins.size(); i++) {
+                permutation.add(false);
+            }
+            boolean valid = false;
+            for (int i = 0; i < columnOrigins.size(); i++) {
+                Set<RelColumnOrigin> expressionLineage = columnOrigins.get(i);
+                if (expressionLineage != null) {
+                    for (RelColumnOrigin origin : expressionLineage) {
+                        if (nullingTables.contains(origin.getOriginTable())) {
+                            permutation.set(i, true);
+                            valid = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (valid) {
+                list.addAll(permutation);
+            }
+        }
+        return list.toArray(new Boolean[list.size()]);
     }
 
     private RelNode createDeleteWhereExists(FrameworkConfig config, RexBuilder rexBuilder, Table materializationTable, String secondaryDeltaTableName) {
@@ -803,11 +855,14 @@ public class TriggerBasedIvmStrategy {
     }
 
     public static RelNode adaptProjectType(LogicalProject logicalProject, RelNode newInput) {
-        List<RexNode> projects = new ArrayList<>(logicalProject.getProjects().size());
-        List<RelDataTypeField> projectFieldList = logicalProject.getRowType().getFieldList();
+        return adaptProjectType(logicalProject, newInput, logicalProject.getProjects(), logicalProject.getRowType());
+    }
+
+    public static RelNode adaptProjectType(LogicalProject logicalProject, RelNode newInput, List<RexNode> logicalProjectProjects, RelDataType rowType) {
+        List<RexNode> projects = new ArrayList<>(logicalProjectProjects.size());
+        List<RelDataTypeField> projectFieldList = rowType.getFieldList();
         List<RelDataTypeField> fieldList = newInput.getRowType().getFieldList();
         List<RelDataTypeField> projectTypeList = new ArrayList<>();
-        List<RexNode> logicalProjectProjects = logicalProject.getProjects();
         for (int i = 0; i < logicalProjectProjects.size(); i++) {
             RexNode project = logicalProjectProjects.get(i);
             RelDataTypeField projectDataTypeField = projectFieldList.get(i);
@@ -980,11 +1035,13 @@ public class TriggerBasedIvmStrategy {
     private static class DeleteSecondaryDeltaVisitor extends PrimaryDeltaVisitor {
 
         private final String primaryDeltaTableName;
+        private final Set<RexTableInputRef.RelTableRef> tableReferences;
         private boolean root = true;
 
-        public DeleteSecondaryDeltaVisitor(FrameworkConfig config, RexBuilder rexBuilder, RelOptTable table, List<String> primaryKeyColumnNames, Table materializationTable, String transitionTableName, String primaryDeltaTableName) {
+        public DeleteSecondaryDeltaVisitor(FrameworkConfig config, RexBuilder rexBuilder, RelOptTable table, List<String> primaryKeyColumnNames, Table materializationTable, String transitionTableName, String primaryDeltaTableName, Set<RexTableInputRef.RelTableRef> tableReferences) {
             super(config, rexBuilder, table, primaryKeyColumnNames, materializationTable, transitionTableName);
             this.primaryDeltaTableName = primaryDeltaTableName;
+            this.tableReferences = tableReferences;
         }
 
         @Override
@@ -999,6 +1056,7 @@ public class TriggerBasedIvmStrategy {
             RelNode node = super.visit(project);
             if (original) {
                 LogicalProject logicalProject = (LogicalProject) node;
+                List<RexNode> projects = logicalProject.getProjects();
                 LogicalFilter filter;
                 if (logicalProject.getInput() instanceof LogicalFilter) {
                     filter = (LogicalFilter) logicalProject.getInput();
@@ -1006,28 +1064,17 @@ public class TriggerBasedIvmStrategy {
                     filter = LogicalFilter.create(logicalProject.getInput(), RexUtil.composeConjunction(rexBuilder, Collections.emptyList()));
                 }
 
+                List<Set<RelColumnOrigin>> expressionOrigins = getExpressionOrigins(config, logicalProject);
+
                 RelBuilder relBuilder = RelBuilder.create(config);
                 RelDataType materializationRowType = materializationTable.getRowType(rexBuilder.getTypeFactory());
                 List<RelDataTypeField> materializationFieldList = materializationRowType.getFieldList();
                 List<RexNode> nodeFields = new ArrayList<>(materializationFieldList.size());
                 List<RexNode> deltaFields = new ArrayList<>(materializationFieldList.size());
+
                 relBuilder.push(filter.getInput());
-                nodeFields.addAll(logicalProject.getProjects());
-                relBuilder.transientScan(primaryDeltaTableName, materializationRowType);
-                for (RelDataTypeField field : materializationFieldList) {
-                    deltaFields.add(relBuilder.field(2, 1, field.getName()));
-                }
 
-                relBuilder.join(JoinRelType.INNER, relBuilder.call(SqlStdOperatorTable.IS_NOT_DISTINCT_FROM, relBuilder.call(SqlStdOperatorTable.ROW, nodeFields), relBuilder.call(SqlStdOperatorTable.ROW, deltaFields)));
-                int filterFieldSize = filter.getRowType().getFieldList().size();
-                List<RexNode> filterFields = new ArrayList<>(filterFieldSize);
-                for (int i = 0; i < filterFieldSize; i++) {
-                    filterFields.add(relBuilder.field(i));
-                }
-                relBuilder.project(filterFields);
-
-                List<RexNode> preFields = new ArrayList<>(sourceTablePrimaryKeyColumnNames.size());
-                List<RexNode> mainQueryFields = new ArrayList<>(sourceTablePrimaryKeyColumnNames.size());
+                // Determine expression lineages
                 RelMetadataQuery metadataQuery = relBuilder.getCluster().getMetadataQuery();
                 RelNode currentRelNode = relBuilder.peek();
                 int size = currentRelNode.getRowType().getFieldCount();
@@ -1035,6 +1082,44 @@ public class TriggerBasedIvmStrategy {
                 for (int i = 0; i < size; i++) {
                     expressionLineages.add(metadataQuery.getExpressionLineage(currentRelNode, relBuilder.field(i)));
                 }
+
+                // Join with a VALUES clause to produce null variants
+                String[] tableReferenceFieldNames = new String[expressionOrigins.size()];
+                for (int i = 0; i < expressionOrigins.size(); i++) {
+                    tableReferenceFieldNames[i] = "c" + i;
+                }
+
+                int valuesOffset = relBuilder.peek().getRowType().getFieldCount();
+                relBuilder.values(tableReferenceFieldNames, (Object[]) permuteNullVariants(expressionOrigins, tableReferences, sourceTable, true));
+                relBuilder.join(JoinRelType.INNER);
+
+                List<RexNode> nullVariantProjects = new ArrayList<>(logicalProject.getProjects().size());
+                for (int i = 0; i < projects.size(); i++) {
+                    nullVariantProjects.add(
+                        rexBuilder.makeCall(
+                            SqlStdOperatorTable.CASE,
+                            relBuilder.equals(relBuilder.field(valuesOffset + i), relBuilder.literal(true)),
+                            projects.get(i),
+                            rexBuilder.makeNullLiteral(projects.get(i).getType())
+                        )
+                    );
+                }
+
+                relBuilder.project(nullVariantProjects);
+
+                // Join transformed query against primary delta
+                nodeFields.addAll(relBuilder.fields());
+                relBuilder.transientScan(primaryDeltaTableName, materializationRowType);
+                for (RelDataTypeField field : materializationFieldList) {
+                    deltaFields.add(relBuilder.field(2, 1, field.getName()));
+                }
+
+                relBuilder.join(JoinRelType.INNER, relBuilder.call(SqlStdOperatorTable.IS_NOT_DISTINCT_FROM, relBuilder.call(SqlStdOperatorTable.ROW, nodeFields), relBuilder.call(SqlStdOperatorTable.ROW, deltaFields)));
+
+                // Anti-Join the query against the source table
+                // We care about results that don't exist in the source table
+                List<RexNode> preFields = new ArrayList<>(sourceTablePrimaryKeyColumnNames.size());
+                List<RexNode> mainQueryFields = new ArrayList<>(sourceTablePrimaryKeyColumnNames.size());
                 for (String columnName : sourceTablePrimaryKeyColumnNames) {
                     int sourceColumnIndex = -1;
                     OUTER: for (int i = 0; i < expressionLineages.size(); i++) {
@@ -1061,15 +1146,14 @@ public class TriggerBasedIvmStrategy {
                 RexNode antiJoinCondition = relBuilder.call(SqlStdOperatorTable.IS_DISTINCT_FROM, relBuilder.call(SqlStdOperatorTable.ROW, preFields), relBuilder.call(SqlStdOperatorTable.ROW, mainQueryFields));
                 relBuilder.antiJoin(antiJoinCondition);
 
+                // Project the first fields again
                 List<RexNode> newProjects = new ArrayList<>(logicalProject.getProjects().size());
-                List<RexNode> projects = logicalProject.getProjects();
                 for (int i = 0; i < projects.size(); i++) {
-                    newProjects.add(relBuilder.alias(projects.get(i), logicalProject.getRowType().getFieldNames().get(i)));
+                    newProjects.add(relBuilder.field(i));
                 }
 
-                relBuilder.project(newProjects);
-
                 node = relBuilder.build();
+                node = adaptProjectType(logicalProject, node, newProjects, logicalProject.getRowType());
             }
             return node;
         }
