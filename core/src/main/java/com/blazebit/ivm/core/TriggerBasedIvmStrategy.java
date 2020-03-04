@@ -393,11 +393,39 @@ public class TriggerBasedIvmStrategy {
         relBuilder.push(relNode);
         RelMetadataQuery metadataQuery = relBuilder.getCluster().getMetadataQuery();
         int size = relNode.getRowType().getFieldCount();
-        List<Set<RelColumnOrigin>> expressionLineages = new ArrayList<>(size);
+        List<Set<RelColumnOrigin>> columnOrigins = new ArrayList<>(size);
         for (int i = 0; i < size; i++) {
-            expressionLineages.add(metadataQuery.getColumnOrigins(relNode, i));
+            columnOrigins.add(metadataQuery.getColumnOrigins(relNode, i));
         }
-        return expressionLineages;
+        return columnOrigins;
+    }
+
+    private static List<Set<RelColumnOrigin>> getTransitiveExpressionOrigins(FrameworkConfig config, RelNode relNode) {
+        RelBuilder relBuilder = RelBuilder.create(config);
+        relBuilder.push(relNode);
+        RelMetadataQuery metadataQuery = relBuilder.getCluster().getMetadataQuery();
+        int size = relNode.getRowType().getFieldCount();
+        List<Set<RelColumnOrigin>> columnOrigins = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            Set<RelColumnOrigin> columnOriginSet = metadataQuery.getColumnOrigins(relNode, i);
+            List<RelColumnOrigin> columnOriginList = new ArrayList<>(columnOriginSet);
+            while (!columnOriginList.isEmpty()) {
+                RelColumnOrigin columnOrigin = columnOriginList.remove(columnOriginList.size() - 1);
+                columnOriginSet.add(columnOrigin);
+                if (columnOrigin.isDerived()) {
+                    // TODO: need custom column origins implementation
+                    // For a query like this
+                    // SELECT a.id, b.id FROM A a JOIN B b ON a.b_id = b.id
+                    // We want that b.id has the origins A and B
+                    // This depends on column usage in the ON clause
+                    // For every predicate that uses columns from B, the other hand side columns must be origins
+                    // Note that this must be done transitively i.e. origins of A should also be origins of B if A is an origin of B etc.
+                }
+            }
+
+            columnOrigins.add(columnOriginSet);
+        }
+        return columnOrigins;
     }
 
     private List<List<String>> permuteNullVariants(List<String> projectionColumns, List<RelDataTypeField> fieldList, List<Set<RelColumnOrigin>> columnOrigins, Set<RexTableInputRef.RelTableRef> tableReferences, RelOptTable sourceTable, boolean withSourceTableOnly) {
@@ -1082,7 +1110,7 @@ public class TriggerBasedIvmStrategy {
             root = false;
             List<Set<RelColumnOrigin>> expressionOrigins = null;
             if (original) {
-                expressionOrigins = getExpressionOrigins(config, project);
+                expressionOrigins = getTransitiveExpressionOrigins(config, project);
             }
             RelNode node = super.visit(project);
             if (original) {
@@ -1096,19 +1124,31 @@ public class TriggerBasedIvmStrategy {
                 }
 
                 RelBuilder relBuilder = RelBuilder.create(config);
-                RelDataType materializationRowType = materializationTable.getRowType(rexBuilder.getTypeFactory());
-                List<RelDataTypeField> materializationFieldList = materializationRowType.getFieldList();
-                List<RexNode> deltaFields = new ArrayList<>(materializationFieldList.size());
+//                relBuilder.push(filter);
+                // NOTE: Calcite apparently confuses aliases when joining LogicalFilter against something in the project above, otherwise we could just push the filter..
+                // TODO: Report or fix this
+                {
+                    List<RelDataTypeField> fieldList = filter.getRowType().getFieldList();
+                    List<RexNode> newProjects = new ArrayList<>(fieldList.size());
+                    List<String> newFieldNames = new ArrayList<>(filter.getRowType().getFieldNames());
+                    for (int i = 0; i < fieldList.size(); i++) {
+                        newProjects.add(new RexInputRef(i, fieldList.get(i).getType()));
 
-                relBuilder.push(filter.getInput());
+                    }
+
+                    newProjects.add(rexBuilder.makeLiteral(true));
+                    newFieldNames.add("__synth");
+                    relBuilder.push(LogicalProject.create(filter, ImmutableList.of(), newProjects, newFieldNames));
+                }
 
                 // Determine expression lineages
                 RelMetadataQuery metadataQuery = relBuilder.getCluster().getMetadataQuery();
-                RelNode currentRelNode = relBuilder.peek();
-                int size = currentRelNode.getRowType().getFieldCount();
+                RelNode currentRelNode = filter.getInput();
+                RelDataType fullRowType = currentRelNode.getRowType();
+                int size = fullRowType.getFieldCount();
                 List<Set<RexNode>> expressionLineages = new ArrayList<>(size);
                 for (int i = 0; i < size; i++) {
-                    expressionLineages.add(metadataQuery.getExpressionLineage(currentRelNode, relBuilder.field(i)));
+                    expressionLineages.add(metadataQuery.getExpressionLineage(currentRelNode, new RexInputRef(i, fullRowType.getFieldList().get(i).getType())));
                 }
 
                 // Join with a VALUES clause to produce null variants
@@ -1121,7 +1161,7 @@ public class TriggerBasedIvmStrategy {
                 relBuilder.values(tableReferenceFieldNames, (Object[]) permuteNullVariants(expressionOrigins, tableReferences, sourceTable, true));
                 relBuilder.join(JoinRelType.FULL);
 
-                List<RexNode> nullVariantProjects = new ArrayList<>(logicalProject.getProjects().size());
+                List<RexNode> nullVariantProjects = new ArrayList<>(projects.size());
                 for (int i = 0; i < projects.size(); i++) {
                     nullVariantProjects.add(
                         rexBuilder.makeCall(
@@ -1165,7 +1205,7 @@ public class TriggerBasedIvmStrategy {
                 relBuilder.antiJoin(antiJoinCondition);
 
                 // Project the first fields again
-                List<RexNode> newProjects = new ArrayList<>(logicalProject.getProjects().size());
+                List<RexNode> newProjects = new ArrayList<>(projects.size());
                 for (int i = 0; i < projects.size(); i++) {
                     newProjects.add(relBuilder.field(i));
                 }
