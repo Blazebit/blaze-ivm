@@ -46,9 +46,9 @@
     </organization>
 
     <scm>
-        <connection>scm:git:git@bitbucket.org:blazebit/blaze-ivm.git</connection>
-        <developerConnection>scm:git:git@bitbucket.org:blazebit/blaze-ivm.git</developerConnection>
-        <url>git@bitbucket.org:blazebit/blaze-ivm.git</url>
+        <connection>scm:git:git@github.com:Blazebit/blaze-ivm.git</connection>
+        <developerConnection>scm:git:git@github.com:Blazebit/blaze-ivm.git</developerConnection>
+        <url>git@github.com:blazebit/Blaze-ivm.git</url>
         <tag>HEAD</tag>
     </scm>
 
